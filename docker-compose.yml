@@ -154,7 +154,9 @@ services:
   # 6. Apache Flink 2.0 — JobManager
   # ──────────────────────────────────────────
   flink-jobmanager:
-    image: apache/flink:2.0-scala_2.12
+    build:
+      context: ./docker/flink
+      dockerfile: Dockerfile
     hostname: flink-jobmanager
     container_name: flink-jobmanager
     depends_on:
@@ -164,6 +166,7 @@ services:
       - "8082:8081"   # Flink Dashboard UI
     command: jobmanager
     environment:
+      SQL_CLIENT_DEFAULTS: /opt/flink/flink-init.sql
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         jobmanager.memory.process.size: 1600m
@@ -197,7 +200,9 @@ services:
   # 7. Apache Flink 2.0 — TaskManager
   # ──────────────────────────────────────────
   flink-taskmanager:
-    image: apache/flink:2.0-scala_2.12
+    build:
+      context: ./docker/flink
+      dockerfile: Dockerfile
     hostname: flink-taskmanager
     container_name: flink-taskmanager
     depends_on:

@@ -252,8 +252,8 @@ Producer                Schema Registry              Consumer
   │◀──Schema ID: 42 ──────────│                          │
   │                           │                          │
   ├──[Magic Byte][Schema ID 42][Avro Payload]────────────▶│
-  │                           │         ◀── "Schema 42 是什麼？" ─┤
-  │                           │──────── Schema 定義 ──────────────▶│
+  │                           │◀── "Schema 42 是什麼？" ─┤
+  │                           │──────── Schema 定義 ─────▶│
   │                           │                          │
 ```
 

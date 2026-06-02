@@ -24,6 +24,132 @@ Binance 和 Alpaca 的資料最終都落在 Bronze，但：
 - 業務查詢幾乎都會 filter `source_type`，分區可大幅減少掃描量
 - 分開分區讓 Compaction 可以只針對特定來源執行，不影響另一個
 
+
+### 步驟一：本機下載 JAR（正確版本）
+
+```bash
+mkdir -p docker/flink/jars
+
+# Kafka Connector（注意：版本是 4.0.0-2.0，不是 3.3.0-2.0）
+curl -L -o docker/flink/jars/flink-sql-connector-kafka.jar \
+  https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/4.0.0-2.0/flink-sql-connector-kafka-4.0.0-2.0.jar
+
+# Iceberg Runtime（注意：版本是 1.10.1，不是 1.9.0）
+curl -L -o docker/flink/jars/iceberg-flink-runtime.jar \
+  https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-2.0/1.10.1/iceberg-flink-runtime-2.0-1.10.1.jar
+
+# Avro + Schema Registry
+curl -L -o docker/flink/jars/flink-avro-confluent-registry.jar \
+  https://repo1.maven.org/maven2/org/apache/flink/flink-avro-confluent-registry/2.0.0/flink-avro-confluent-registry-2.0.0.jar
+
+# AWS SDK（MinIO S3 存取）
+curl -L -o docker/flink/jars/aws-bundle.jar \
+  https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/2.29.51/bundle-2.29.51.jar
+  
+curl -L -o docker/flink/jars/hadoop-common.jar \
+  https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.4/hadoop-common-3.3.4.jar
+
+# 確認 4 個檔案，各應 > 1MB
+ls -lh docker/flink/jars/
+```
+
+### 步驟二：建立 Dockerfile
+
+```bash
+cat > docker/flink/Dockerfile << 'EOF'
+FROM apache/flink:2.0-scala_2.12
+
+# 從本機複製，不依賴 build 時網路
+COPY jars/*.jar /opt/flink/lib/
+
+RUN echo "Installed JARs:" && ls /opt/flink/lib/ | grep -E "kafka|iceberg|avro|bundle|hadoop"
+EOF
+```
+
+### 步驟三：更新 docker-compose.yml 的 Flink 部分
+
+將 `image:` 改成 `build:`，`command` 改回簡單形式：
+
+```yaml
+flink-jobmanager:
+  build:
+    context: ./docker/flink
+    dockerfile: Dockerfile
+  hostname: flink-jobmanager
+  container_name: flink-jobmanager
+  command: jobmanager  
+
+flink-taskmanager:
+  build:
+    context: ./docker/flink
+    dockerfile: Dockerfile
+  hostname: flink-taskmanager
+  container_name: flink-taskmanager
+  command: taskmanager
+
+```
+
+```bash
+# Build（第一次約 2～3 分鐘）
+docker-compose build flink-jobmanager flink-taskmanager
+
+# 確認 JAR 有打進 image
+docker run --rm streaming-poc-flink-jobmanager ls /opt/flink/lib/ | grep -E "kafka|iceberg|avro|bundle|hadoop"
+
+# 啟動
+docker-compose up -d flink-jobmanager flink-taskmanager
+```
+
+ 2. 前置：SQL Client 初始化檔案
+
+> ⚠️ **重要**：Flink SQL Client 的 Catalog 是 **Session 級別**，不會自動持久化。  
+> 每次重開 SQL Client 都必須重新 `CREATE CATALOG`。  
+> 解法：建立 `flink-init.sql`，啟動時自動載入。
+
+### 建立初始化檔案
+
+```bash
+cat > flink-init.sql << 'EOF'
+-- Iceberg Catalog（每次啟動 SQL Client 必須先建立）
+CREATE CATALOG IF NOT EXISTS iceberg_catalog WITH (
+  'type'                 = 'iceberg',
+  'catalog-type'         = 'rest',
+  'uri'                  = 'http://iceberg-rest:8181',
+  'warehouse'            = 's3://warehouse/',
+  'io-impl'              = 'org.apache.iceberg.aws.s3.S3FileIO',
+  's3.endpoint'          = 'http://minio:9000',
+  's3.access-key-id'     = 'minioadmin',
+  's3.secret-access-key' = 'minioadmin',
+  's3.path-style-access' = 'true'
+);
+
+-- 全域設定
+SET 'execution.checkpointing.interval' = '30s';
+SET 'execution.checkpointing.mode'     = 'EXACTLY_ONCE';
+SET 'table.exec.source.idle-timeout'   = '30s';
+EOF
+
+# 複製到容器內
+docker cp flink-init.sql flink-jobmanager:/opt/flink/flink-init.sql
+
+
+```bash
+# Step 1：進入 SQL Client
+docker exec -it flink-jobmanager ./bin/sql-client.sh
+```
+
+```SQL
+-- 切換到 Iceberg catalog
+USE CATALOG iceberg_catalog;
+
+-- 建立 bronze database
+CREATE DATABASE IF NOT EXISTS bronze;
+
+-- 切換進去
+USE bronze;
+```
+
+
 ### flink_bronze.sql
 
 ```sql
@@ -42,9 +168,7 @@ CREATE TABLE kafka_market_trades (
   is_buyer_maker BOOLEAN,
   agg_trade_id  BIGINT,
   -- 將 Bigint 毫秒 Timestamp 轉換為 Flink TIMESTAMP 型態
-  event_ts AS TO_TIMESTAMP_LTZ(trade_time, 3),
-  -- Watermark：允許 500ms 遲到（Binance aggTrade 通常 < 100ms，股市資料可能稍大）
-  WATERMARK FOR event_ts AS event_ts - INTERVAL '500' MILLISECOND
+  event_ts AS TO_TIMESTAMP_LTZ(trade_time, 3)
 ) WITH (
   'connector'                    = 'kafka',
   'topic'                        = 'market-trades',
@@ -72,11 +196,11 @@ CREATE TABLE iceberg_bronze_trades (
   is_buyer_maker BOOLEAN,
   agg_trade_id  BIGINT,
   event_ts      TIMESTAMP(3),
-  ingest_ts     TIMESTAMP(3)
+  ingest_ts     TIMESTAMP(3),
+  trade_date     STRING  
 ) PARTITIONED BY (
   source_type,
-  asset_class,
-  DATE_FORMAT(event_ts, 'yyyy-MM-dd')
+  trade_date
 ) WITH (
   'connector'              = 'iceberg',
   'catalog-name'           = 'iceberg_catalog',
