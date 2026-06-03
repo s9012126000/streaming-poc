@@ -8,7 +8,8 @@ CREATE CATALOG IF NOT EXISTS iceberg_catalog WITH (
   's3.endpoint'           = 'http://minio:9000',
   's3.access-key-id'      = 'minioadmin',
   's3.secret-access-key'  = 'minioadmin',
-  's3.path-style-access'  = 'true'
+  's3.path-style-access'  = 'true',
+  'client.region'         = 'us-east-1'
 );
 
 -- ================== Global Settings ==================
@@ -25,12 +26,12 @@ USE default_database;
 DROP TABLE IF EXISTS kafka_trades_source;
 
 CREATE TABLE kafka_trades_source (
-  source_type    STRING,
-  asset_class    STRING,
-  symbol         STRING,
-  price          DOUBLE,
-  size           DOUBLE,
-  trade_time     BIGINT,
+  source_type    STRING NOT NULL,
+  asset_class    STRING NOT NULL,
+  symbol         STRING NOT NULL,
+  price          DOUBLE NOT NULL,
+  size           DOUBLE NOT NULL,
+  trade_time     BIGINT NOT NULL,
   exchange       STRING,
   tape           STRING,
   is_buyer_maker BOOLEAN,
@@ -40,11 +41,19 @@ CREATE TABLE kafka_trades_source (
   'topic'                        = 'market-trades',
   'properties.bootstrap.servers' = 'broker:29092',
   'properties.group.id'          = 'flink-bronze-consumer',
-  'scan.startup.mode'            = 'earliest-offset',
+  'scan.startup.mode'            = 'latest-offset',
   'value.format'                 = 'avro-confluent',
   'value.avro-confluent.url'      = 'http://schema-registry:8081',
   'value.avro-confluent.schema-registry.subject'  = 'market-trades-value'
 );
+
+
+-- 在 Flink SQL Client 裡執行
+USE CATALOG iceberg_catalog;
+USE bronze;
+
+-- 先 DROP（清除 catalog 裡的 metadata pointer）
+DROP TABLE IF EXISTS bronze.trades;
 
 -- ================== Iceberg Bronze Table ==================
 CREATE TABLE IF NOT EXISTS iceberg_catalog.bronze.trades (

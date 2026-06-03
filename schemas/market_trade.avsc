@@ -6,27 +6,11 @@
   "fields": [
     {
       "name": "source_type",
-      "type": {
-        "type": "enum",
-        "name": "SourceType",
-        "symbols": [
-          "ALPACA_STOCK",
-          "BINANCE_CRYPTO"
-        ]
-      },
-      "doc": "Source type"
+      "type": "string"
     },
     {
       "name": "asset_class",
-      "type": {
-        "type": "enum",
-        "name": "AssetClass",
-        "symbols": [
-          "STOCK",
-          "CRYPTO"
-        ]
-      },
-      "doc": "Asset class"
+      "type": "string"
     },
     {
       "name": "symbol",
