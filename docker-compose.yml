@@ -1,49 +1,160 @@
 version: "3.8"
 
-services:
+networks:
+  data-platform:
+    driver: bridge
 
-  # ──────────────────────────────────────────
-  # 1. Kafka Broker（KRaft 模式)
-  # ──────────────────────────────────────────
-  broker:
+services:
+# ──────────────────────────────────────────
+# 1.1. Kafka Broker-1（KRaft)
+# ──────────────────────────────────────────
+  broker-1:
     image: confluentinc/cp-kafka:7.9.0
-    hostname: broker
-    container_name: broker
+    hostname: broker-1
+    container_name: broker-1
+    restart: unless-stopped
+    networks: [data-platform]
     ports:
-      - "9092:9092"       # 外部連線（Producer/Consumer on host）
-      - "29092:29092"     # 內部連線（容器間通訊）
+      - "9092:9092"
     environment:
-      # KRaft 角色設定
+      # ── KRaft 角色 ──────────────────────────
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker:29093
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker-1:29093,2@broker-2:29093,3@broker-3:29093
 
-      # Listener 設定
-      KAFKA_LISTENERS: PLAINTEXT://broker:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://broker:29093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092
+      # ── Listener ────────────────────────────
+      KAFKA_LISTENERS: PLAINTEXT://broker-1:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://broker-1:29093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker-1:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
 
-      # Topic 設定
+      # ── Topic 設定（Production）─────────────
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      KAFKA_LOG_RETENTION_HOURS: 48
-      KAFKA_NUM_PARTITIONS: 1
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 6                 # Broker count * 2
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3     # 3 replica
+      KAFKA_MIN_INSYNC_REPLICAS: 2            # ACK when at least 2 replica sync
 
-      # KRaft 叢集唯一 ID
+      # ── 內部 Topic ───────────────────────────
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+
+      # ── Retention ───────────────────────────
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_RETENTION_BYTES: 107374182400     # 100GB per partition
+
+      # ── 效能調優 ────────────────────────────
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 3000
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824          # 1GB per segment
+      KAFKA_NUM_RECOVERY_THREADS_PER_DATA_DIR: 4
+
       CLUSTER_ID: "7YkApeILRgCTCrfxFxEhjw"
     volumes:
-      - broker_data:/var/lib/kafka/data
+      - broker_1_data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
       interval: 10s
       timeout: 10s
       retries: 10
+      start_period: 30s
+
+# ──────────────────────────────────────────
+# 1.2. Kafka Broker-2
+# ──────────────────────────────────────────
+  broker-2:
+    image: confluentinc/cp-kafka:7.9.0
+    hostname: broker-2
+    container_name: broker-2
+    restart: unless-stopped
+    networks: [data-platform]
+    ports:
+      - "9093:9092"                               # ← host port 改為 9093
+    environment:
+      KAFKA_NODE_ID: 2                             # ← 2
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker-1:29093,2@broker-2:29093,3@broker-3:29093
+
+      KAFKA_LISTENERS: PLAINTEXT://broker-2:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://broker-2:29093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker-2:29092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_RETENTION_BYTES: 107374182400
+
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 3000
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_NUM_RECOVERY_THREADS_PER_DATA_DIR: 4
+
+      CLUSTER_ID: "7YkApeILRgCTCrfxFxEhjw"
+    volumes:
+      - broker_2_data:/var/lib/kafka/data          # ← broker_2_data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+# ──────────────────────────────────────────
+# 1.3. Kafka Broker-3
+# ──────────────────────────────────────────
+  broker-3:
+    image: confluentinc/cp-kafka:7.9.0
+    hostname: broker-3
+    container_name: broker-3
+    restart: unless-stopped
+    networks: [data-platform]
+    ports:
+      - "9094:9092"                               # ← host port 改為 9094
+    environment:
+      KAFKA_NODE_ID: 3                             # ← 3
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker-1:29093,2@broker-2:29093,3@broker-3:29093
+
+      KAFKA_LISTENERS: PLAINTEXT://broker-3:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://broker-3:29093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker-3:29092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_RETENTION_BYTES: 107374182400
+
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 3000
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_NUM_RECOVERY_THREADS_PER_DATA_DIR: 4
+
+      CLUSTER_ID: "7YkApeILRgCTCrfxFxEhjw"
+    volumes:
+      - broker_3_data:/var/lib/kafka/data          # ← broker_3_data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
 
   # ──────────────────────────────────────────
   # 2. Schema Registry
@@ -53,19 +164,25 @@ services:
     hostname: schema-registry
     container_name: schema-registry
     depends_on:
-      broker:
+      broker-1:
+        condition: service_healthy
+      broker-2:
+        condition: service_healthy
+      broker-3:
         condition: service_healthy
     ports:
       - "8081:8081"
     environment:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
-      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: broker:29092
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: broker-1:29092,broker-2:29092,broker-3:29092
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
       interval: 10s
       timeout: 5s
       retries: 10
+    networks: [data-platform]
 
   # ──────────────────────────────────────────
   # 3. Kafka Control Center（監控 UI）
@@ -75,20 +192,32 @@ services:
     hostname: control-center
     container_name: control-center
     depends_on:
-      broker:
+      broker-1:
+        condition: service_healthy
+      broker-2:
+        condition: service_healthy
+      broker-3:
         condition: service_healthy
       schema-registry:
         condition: service_healthy
     ports:
       - "9021:9021"
+    restart: unless-stopped
     environment:
-      CONTROL_CENTER_BOOTSTRAP_SERVERS: broker:29092
+      CONTROL_CENTER_BOOTSTRAP_SERVERS: broker-1:29092,broker-2:29092,broker-3:29092
       CONTROL_CENTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
       CONTROL_CENTER_REPLICATION_FACTOR: 1
       CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
       CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS: 1
       CONFLUENT_METRICS_TOPIC_REPLICATION: 1
       PORT: 9021
+    networks: [data-platform]
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9021" ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s   # Control Center is slow to start
 
   # ──────────────────────────────────────────
   # 4. MinIO（本地 S3，Iceberg Parquet 儲存）
@@ -101,9 +230,10 @@ services:
       - "9000:9000"   # S3 API
       - "9001:9001"   # Console UI
     command: server /data --console-address ":9001"
+    restart: unless-stopped
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - minio_data:/data
     healthcheck:
@@ -111,6 +241,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    networks: [data-platform]
 
   # MinIO bucket 初始化（自動建立 warehouse bucket）
   minio-init:
@@ -121,13 +252,12 @@ services:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-        mc alias set local http://minio:9000 minioadmin minioadmin &&
-        mc mb --ignore-existing local/warehouse &&
-        mc mb --ignore-existing local/warehouse/checkpoints &&
-        echo 'MinIO buckets ready.' &&
-        exit 0
-      "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/warehouse &&
+      mc mb --ignore-existing local/warehouse/checkpoints &&
+      echo 'MinIO buckets ready.' && exit 0"
     restart: "no"
+    networks: [data-platform]
 
   # ──────────────────────────────────────────
   # 5. Iceberg REST Catalog
@@ -136,19 +266,26 @@ services:
     image: tabulario/iceberg-rest:latest
     hostname: iceberg-rest
     container_name: iceberg-rest
+    networks: [data-platform]
     depends_on:
       minio:
         condition: service_healthy
     ports:
       - "8181:8181"
     environment:
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       AWS_REGION: us-east-1
       CATALOG_WAREHOUSE: s3://warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://minio:9000
       CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    restart: unless-stopped
+#    healthcheck:
+#      test: [ "CMD", "curl", "-f", "http://localhost:8181/v1/config" ]
+#      interval: 15s
+#      timeout: 5s
+#      retries: 10
 
   # ──────────────────────────────────────────
   # 6. Apache Flink 2.0 — JobManager
@@ -162,14 +299,26 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+      broker-1:
+        condition: service_healthy
+      broker-2:
+        condition: service_healthy
+      broker-3:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_started
     ports:
       - "8082:8081"   # Flink Dashboard UI
     command: jobmanager
+    restart: unless-stopped
     environment:
       SQL_CLIENT_DEFAULTS: /opt/flink/flink-init.sql
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         jobmanager.memory.process.size: 1600m
+        properties.bootstrap.servers: broker-1:29092,broker-2:29092,broker-3:29092
 
         # State Backend（RocksDB，存於 MinIO）
         state.backend: rocksdb
@@ -179,8 +328,8 @@ services:
 
         # MinIO / S3 連線設定
         s3.endpoint: http://minio:9000
-        s3.access-key: minioadmin
-        s3.secret-key: minioadmin
+        s3.access-key: ${MINIO_ROOT_USER}
+        s3.secret-key: ${MINIO_ROOT_PASSWORD}
         s3.path.style.access: true
 
         # Checkpoint 設定（Exactly-Once）
@@ -195,6 +344,13 @@ services:
         # Metrics（Prometheus 格式）
         metrics.reporter.prometheus.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
         metrics.reporter.prometheus.port: 9249
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8081/" ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [data-platform]
 
   # ──────────────────────────────────────────
   # 7. Apache Flink 2.0 — TaskManager
@@ -206,8 +362,12 @@ services:
     hostname: flink-taskmanager
     container_name: flink-taskmanager
     depends_on:
-      - flink-jobmanager
+      minio:
+        condition: service_healthy
+      flink-jobmanager:
+        condition: service_healthy
     command: taskmanager
+    restart: unless-stopped
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
@@ -218,16 +378,20 @@ services:
         state.backend: rocksdb
         state.backend.rocksdb.memory.managed: true
         state.checkpoints.dir: s3://warehouse/checkpoints
+        state.savepoints.dir: s3://warehouse/savepoints
 
         # MinIO / S3 連線設定
         s3.endpoint: http://minio:9000
-        s3.access-key: minioadmin
-        s3.secret-key: minioadmin
+        s3.access-key: ${MINIO_ROOT_USER}
+        s3.secret-key: ${MINIO_ROOT_PASSWORD}
         s3.path.style.access: true
+    networks: [data-platform]
 
 # ──────────────────────────────────────────
 # Volumes
 # ──────────────────────────────────────────
 volumes:
-  broker_data:
+  broker_1_data:
+  broker_2_data:
+  broker_3_data:
   minio_data:
