@@ -39,7 +39,7 @@ CREATE TABLE kafka_trades_source (
 ) WITH (
   'connector'                    = 'kafka',
   'topic'                        = 'market-trades',
-  'properties.bootstrap.servers' = 'broker:29092',
+  'properties.bootstrap.servers' = 'broker-1:29092,broker-2:29092,broker-3:29092',
   'properties.group.id'          = 'flink-bronze-consumer',
   'scan.startup.mode'            = 'latest-offset',
   'value.format'                 = 'avro-confluent',

@@ -220,6 +220,31 @@ services:
       start_period: 60s   # Control Center is slow to start
 
   # ──────────────────────────────────────────
+  # 3. Kafka init topics
+  # ──────────────────────────────────────────
+  kafka-init:
+    image: confluentinc/cp-kafka:7.9.0
+    container_name: kafka-init
+    depends_on:
+      broker-1:
+        condition: service_healthy
+      broker-2:
+        condition: service_healthy
+      broker-3:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for Kafka to be ready...' &&
+      kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-trades  --partitions 16 --replication-factor 3 &&
+      kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-quotes  --partitions 16 --replication-factor 3 &&
+      kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-alerts  --partitions 4  --replication-factor 3 &&
+      kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-dlq     --partitions 4  --replication-factor 3 &&
+      echo 'Topics created successfully.' &&
+      kafka-topics --bootstrap-server broker-1:29092 --list"
+    restart: "no"
+    networks: [data-platform]
+
+  # ──────────────────────────────────────────
   # 4. MinIO（本地 S3，Iceberg Parquet 儲存）
   # ──────────────────────────────────────────
   minio:
@@ -333,9 +358,10 @@ services:
         s3.path.style.access: true
 
         # Checkpoint 設定（Exactly-Once）
-        execution.checkpointing.interval: 30s
+        execution.checkpointing.interval: 60s
+        execution.checkpointing.min-pause: 10s
         execution.checkpointing.mode: EXACTLY_ONCE
-        execution.checkpointing.max-concurrent-checkpoints: 1
+        execution.checkpointing.max-concurrent-checkpoints: 2
         execution.checkpointing.timeout: 60s
 
         # Watermark Idle Timeout（解決股市收盤後 Watermark 停止問題）
