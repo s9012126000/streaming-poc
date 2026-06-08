@@ -31,5 +31,3 @@ RUN set -ex && \
     cp /opt/flink/opt/flink-s3-fs-hadoop-*.jar /opt/flink/plugins/s3-fs-hadoop/ && \
     echo '=== Flink plugins ===' && ls -R /opt/flink/plugins && \
     echo '=== Flink lib ===' && ls /opt/flink/lib
-
-COPY ./flink-init.sql /opt/flink/flink-init.sql
