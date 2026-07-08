@@ -1,6 +1,8 @@
 __pycache__/
 **/.DS_Store
 
+doc/
+
 /bk
 .env
 *.jar

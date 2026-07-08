@@ -39,7 +39,9 @@ CREATE TABLE kafka_trades_source (
   exchange        STRING,
   tape            STRING,
   is_buyer_maker  BOOLEAN,
-  agg_trade_id    BIGINT
+  agg_trade_id    BIGINT,
+  event_ts        AS TO_TIMESTAMP_LTZ(trade_time, 3),
+  WATERMARK FOR event_ts AS event_ts - INTERVAL '5' SECOND
 ) WITH (
   'connector'                                   = 'kafka',
   'topic'                                       = 'market-trades',
@@ -50,6 +52,23 @@ CREATE TABLE kafka_trades_source (
   'value.format'                                = 'avro-confluent',
   'value.avro-confluent.url'                    = 'http://schema-registry:8081',
   'value.avro-confluent.schema-registry.subject'= 'market-trades-value'
+);
+
+DROP TABLE IF EXISTS kafka_alerts_sink;
+
+CREATE TABLE kafka_alerts_sink (
+  symbol       STRING,
+  source_type  STRING,
+  volume       DOUBLE,
+  mean         DOUBLE,
+  stddev       DOUBLE,
+  sigma        DOUBLE,
+  alert_ts     TIMESTAMP(3)
+) WITH (
+  'connector'                    = 'kafka',
+  'topic'                        = 'market-alerts',
+  'properties.bootstrap.servers' = 'broker-1:29092,broker-2:29092,broker-3:29092',
+  'format'                       = 'json'
 );
 
 -- ================== Iceberg Bronze Sink Table ==================
@@ -76,5 +95,25 @@ CREATE TABLE IF NOT EXISTS iceberg_catalog.bronze.trades (
 WITH (
   'write.format.default'          = 'parquet',
   'write.target-file-size-bytes'  = '67108864',
+  'write.parquet.compression-codec' = 'snappy'
+);
+
+USE silver;
+
+DROP TABLE IF EXISTS iceberg_catalog.silver.vwap_1min;
+
+CREATE TABLE IF NOT EXISTS iceberg_catalog.silver.vwap_1min (
+  source_type   STRING,
+  symbol        STRING,
+  window_start  TIMESTAMP(3),
+  window_end    TIMESTAMP(3),
+  vwap          DOUBLE,
+  volume        DOUBLE,
+  trade_count   BIGINT,
+  window_date   STRING
+) PARTITIONED BY (source_type, window_date)
+WITH (
+  'write.format.default'            = 'parquet',
+  'write.target-file-size-bytes'    = '67108864',
   'write.parquet.compression-codec' = 'snappy'
 );

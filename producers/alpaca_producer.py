@@ -57,4 +57,4 @@ class AlpacaProducer:
         wss = StockDataStream(self.api_key, self.secret_key)
         wss.subscribe_trades(self.handle_trade, *NASDAQ_TOP30)
         logger.info(f"[ALPACA] 🟢 訂閱 {len(NASDAQ_TOP30)} 支 NASDAQ 股票")
-        await wss.run()
+        await asyncio.to_thread(wss.run)
