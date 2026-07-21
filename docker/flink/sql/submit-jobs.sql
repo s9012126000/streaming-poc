@@ -1,22 +1,7 @@
 -- ================== Job: Kafka → Iceberg Bronze Trades ==================
-SET 'pipeline.name' = 'kafka-to-iceberg-bronze-trades';
-SET 'parallelism.default' = '2';
-INSERT INTO iceberg_catalog.bronze.trades
-SELECT
-  source_type,
-  asset_class,
-  symbol,
-  price,
-  size,
-  trade_time,
-  exchange,
-  tape,
-  is_buyer_maker,
-  agg_trade_id,
-  TO_TIMESTAMP_LTZ(trade_time, 3)                             AS event_ts,
-  CURRENT_TIMESTAMP                                           AS ingest_ts,
-  DATE_FORMAT(TO_TIMESTAMP_LTZ(trade_time, 3), 'yyyy-MM-dd') AS trade_date
-FROM default_catalog.default_database.kafka_trades_source;
+-- Bronze ingest moved to the PyFlink DataStream job jobs/bronze_ingest.py (Week 4):
+-- SQL avro-confluent can't side-output poison messages to the DLQ. Submitted by
+-- flink-init after these SQL jobs via `flink run -py`.
 
 -- ================== Job: VWAP 1-min Silver ==================
 SET 'pipeline.name' = 'vwap-1min-silver';

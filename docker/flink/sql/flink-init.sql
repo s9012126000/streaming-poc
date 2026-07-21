@@ -43,15 +43,16 @@ CREATE TABLE kafka_trades_source (
   event_ts        AS TO_TIMESTAMP_LTZ(trade_time, 3),
   WATERMARK FOR event_ts AS event_ts - INTERVAL '5' SECOND
 ) WITH (
-  'connector'                                   = 'kafka',
-  'topic'                                       = 'market-trades',
-  'properties.bootstrap.servers'                = 'broker-1:29092,broker-2:29092,broker-3:29092',
-  'properties.group.id'                         = 'flink-bronze-consumer',
-  'properties.enable.auto.commit'               = 'false',
-  'scan.startup.mode'                           = 'latest-offset',
-  'value.format'                                = 'avro-confluent',
-  'value.avro-confluent.url'                    = 'http://schema-registry:8081',
-  'value.avro-confluent.schema-registry.subject'= 'market-trades-value'
+  'connector'                     = 'kafka',
+  -- 讀「已驗證」的 clean topic（由 PyFlink Bronze job 產出），不直接讀 raw market-trades。
+  -- 毒訊息只會打到 Bronze decoder（→ DLQ），不會 crash-loop 這裡的 VWAP / 3-sigma。
+  'topic'                         = 'market-trades-clean',
+  'properties.bootstrap.servers'  = 'broker-1:29092,broker-2:29092,broker-3:29092',
+  'properties.group.id'           = 'flink-analytics-consumer',
+  'properties.enable.auto.commit' = 'false',
+  'scan.startup.mode'             = 'latest-offset',
+  'format'                        = 'json',
+  'json.ignore-parse-errors'      = 'true'
 );
 
 DROP TABLE IF EXISTS kafka_alerts_sink;

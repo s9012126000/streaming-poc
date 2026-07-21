@@ -31,3 +31,18 @@ RUN set -ex && \
     cp /opt/flink/opt/flink-s3-fs-hadoop-*.jar /opt/flink/plugins/s3-fs-hadoop/ && \
     echo '=== Flink plugins ===' && ls -R /opt/flink/plugins && \
     echo '=== Flink lib ===' && ls /opt/flink/lib
+
+# PyFlink + confluent-kafka for the DLQ Bronze job.
+# Base image is a JRE on arm64 → pemja (PyFlink's JNI bridge) has no wheel and
+# builds from source, needing gcc + Python.h + jni.h. Install a JDK + build tools
+# and point JAVA_HOME at the JDK (its include/ has jni.h) for the pip build.
+USER root
+RUN set -ex && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-dev build-essential openjdk-17-jdk-headless && \
+    ln -sf /usr/bin/python3 /usr/bin/python && \
+    JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(which javac)")")")" \
+      pip3 install --no-cache-dir \
+      apache-flink==2.0.0 "confluent-kafka[avro]==2.5.0" && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*

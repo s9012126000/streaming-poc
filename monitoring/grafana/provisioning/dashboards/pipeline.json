@@ -1,0 +1,127 @@
+{
+  "uid": "pipeline-core",
+  "title": "Pipeline Core (Week 4)",
+  "schemaVersion": 39,
+  "editable": true,
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "15s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Consumer lag (flink-bronze-consumer)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PROM"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "sum(kafka_consumergroup_lag{consumergroup=\"flink-bronze-consumer\"})",
+          "legendFormat": "lag"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Checkpoint duration & size",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PROM"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "flink_jobmanager_job_lastCheckpointDuration",
+          "legendFormat": "{{job_name}} duration (ms)"
+        },
+        {
+          "expr": "flink_jobmanager_job_lastCheckpointSize",
+          "legendFormat": "{{job_name}} size (bytes)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "axisPlacement": "left"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/.*size \\(bytes\\)$/"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 3,
+      "title": "Watermark lag (source operator)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PROM"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "time()*1000 - max(flink_taskmanager_job_task_operator_currentOutputWatermark > 0)",
+          "legendFormat": "watermark lag (ms)"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Records / sec (source)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PROM"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(flink_taskmanager_job_task_operator_numRecordsOutPerSecond[1m]))",
+          "legendFormat": "records/s"
+        }
+      ]
+    }
+  ]
+}

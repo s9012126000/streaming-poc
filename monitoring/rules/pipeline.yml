@@ -1,0 +1,37 @@
+groups:
+  - name: pipeline-slo
+    rules:
+      # SLO 1: Bronze 資料新鮮度 — proxy via source records/s == 0
+      # (真正的 max(ingest_ts) 需要 Trino 端 probe，PoC 用「來源沒在動」代替，見 week4 doc)
+      - alert: BronzeStalled
+        expr: sum(rate(flink_taskmanager_job_task_operator_numRecordsOutPerSecond[1m])) == 0
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "Bronze source 5 分鐘沒有輸出任何 record — producer 掛了或 pipeline 卡住"
+
+      # SLO 2: consumer 不積壓
+      - alert: ConsumerLagGrowing
+        expr: sum(kafka_consumergroup_lag{consumergroup="flink-bronze-consumer"}) > 100000
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: "flink-bronze-consumer lag 持續高於 10 萬超過 10 分鐘"
+
+      # SLO 3: checkpoint 健康
+      - alert: CheckpointUnhealthy
+        expr: increase(flink_jobmanager_job_numberOfFailedCheckpoints[10m]) >= 3
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "10 分鐘內 checkpoint 失敗 >= 3 次"
+
+      # DLQ 深度：正常應為 0
+      - alert: DLQNotEmpty
+        expr: >
+          sum(kafka_topic_partition_current_offset{topic="market-dlq"})
+          - sum(kafka_topic_partition_oldest_offset{topic="market-dlq"}) > 0
+        for: 0m
+        labels: { severity: warn }
+        annotations:
+          summary: "market-dlq 出現訊息 — 有毒訊息被導入 DLQ，需人工檢視"

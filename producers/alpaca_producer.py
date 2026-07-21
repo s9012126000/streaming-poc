@@ -25,7 +25,10 @@ class AlpacaProducer:
         self.secret_key = secret_key
 
         schema_registry = SchemaRegistryClient({"url": schema_registry_url})
-        self.serializer = AvroSerializer(schema_registry, schema_str)
+        # schema 由 scripts/register_schema.sh 明確註冊，producer 不自動註冊：
+        # 否則改到 market_trade.avsc 就會在下次送資料時無聲地產生新版本。
+        self.serializer = AvroSerializer(schema_registry, schema_str,
+                                         conf={"auto.register.schemas": False})
         self.producer   = Producer({"bootstrap.servers": kafka_bootstrap})
         self.count      = 0
 

@@ -116,41 +116,6 @@ services:
     networks: [data-platform]
 
   # ──────────────────────────────────────────
-  # 3. Kafka Control Center（監控 UI）
-  # ──────────────────────────────────────────
-  control-center:
-    image: confluentinc/cp-enterprise-control-center:7.9.0
-    hostname: control-center
-    container_name: control-center
-    depends_on:
-      broker-1:
-        condition: service_healthy
-      broker-2:
-        condition: service_healthy
-      broker-3:
-        condition: service_healthy
-      schema-registry:
-        condition: service_healthy
-    ports:
-      - "9021:9021"
-    restart: unless-stopped
-    environment:
-      CONTROL_CENTER_BOOTSTRAP_SERVERS: broker-1:29092,broker-2:29092,broker-3:29092
-      CONTROL_CENTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
-      CONTROL_CENTER_REPLICATION_FACTOR: 1
-      CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
-      CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS: 1
-      CONFLUENT_METRICS_TOPIC_REPLICATION: 1
-      PORT: 9021
-    networks: [data-platform]
-    healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:9021" ]
-      interval: 30s
-      timeout: 10s
-      retries: 10
-      start_period: 60s   # Control Center is slow to start
-
-  # ──────────────────────────────────────────
   # 3. Kafka init topics
   # ──────────────────────────────────────────
   kafka-init:
@@ -163,15 +128,25 @@ services:
         condition: service_healthy
       broker-3:
         condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    volumes:
+      - ./schemas:/schemas:ro
+      - ./scripts:/scripts:ro
+    environment:
+      SCHEMA_REGISTRY: http://schema-registry:8081
+      AVSC: /schemas/market_trade.avsc
     entrypoint: >
       /bin/sh -c "
       echo 'Waiting for Kafka to be ready...' &&
       kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-trades  --partitions 16 --replication-factor 3 &&
+      kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-trades-clean --partitions 16 --replication-factor 3 &&
       kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-quotes  --partitions 16 --replication-factor 3 &&
       kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-alerts  --partitions 4  --replication-factor 3 &&
       kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-dlq     --partitions 4  --replication-factor 3 &&
       echo 'Topics created successfully.' &&
-      kafka-topics --bootstrap-server broker-1:29092 --list"
+      kafka-topics --bootstrap-server broker-1:29092 --list &&
+      bash /scripts/register_schema.sh"
     restart: "no"
     networks: [data-platform]
 
@@ -331,6 +306,8 @@ services:
         s3.access-key: ${MINIO_ROOT_USER}
         s3.secret-key: ${MINIO_ROOT_PASSWORD}
         s3.path.style.access: true
+        metrics.reporter.prometheus.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prometheus.port: 9249
     networks: [data-platform]
 
   # ──────────────────────────────────────────
@@ -346,10 +323,11 @@ services:
         condition: service_healthy
       flink-taskmanager:
         condition: service_started
-    entrypoint: ["/bin/sh", "-c", "/opt/flink/bin/sql-client.sh -D rest.address=flink-jobmanager -i /opt/flink/sql/flink-init.sql -f /opt/flink/sql/submit-jobs.sql"]
+    entrypoint: ["/bin/sh", "-c", "/opt/flink/bin/sql-client.sh -D rest.address=flink-jobmanager -i /opt/flink/sql/flink-init.sql -f /opt/flink/sql/submit-jobs.sql && /opt/flink/bin/flink run -d -m flink-jobmanager:8081 -py /opt/flink/jobs/bronze_ingest.py"]
     restart: "no"
     volumes:
       - ./docker/flink/sql:/opt/flink/sql
+      - ./docker/flink/jobs:/opt/flink/jobs
     networks: [data-platform]
 
   trino:
@@ -368,6 +346,58 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - ./docker/trino/etc/catalog:/etc/trino/catalog
+    networks: [data-platform]
+
+  # ──────────────────────────────────────────
+  # 9. 監控三件套 + kafka-exporter
+  # ──────────────────────────────────────────
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: kafka-exporter
+    depends_on:
+      broker-1:
+        condition: service_healthy
+    command:
+      - --kafka.server=broker-1:29092
+      - --kafka.server=broker-2:29092
+      - --kafka.server=broker-3:29092
+    restart: unless-stopped
+    networks: [data-platform]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/rules:/etc/prometheus/rules
+    restart: unless-stopped
+    networks: [data-platform]
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager
+    ports:
+      - "9095:9093"   # 9093 host port 被 broker-2 佔用，對外改 9095
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    restart: unless-stopped
+    networks: [data-platform]
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    restart: unless-stopped
     networks: [data-platform]
 
 # ──────────────────────────────────────────
