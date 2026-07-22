@@ -11,7 +11,7 @@
   "panels": [
     {
       "id": 1,
-      "title": "Consumer lag (flink-bronze-consumer)",
+      "title": "Consumer lag (by group)",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -25,8 +25,8 @@
       },
       "targets": [
         {
-          "expr": "sum(kafka_consumergroup_lag{consumergroup=\"flink-bronze-consumer\"})",
-          "legendFormat": "lag"
+          "expr": "sum by (consumergroup) (kafka_consumergroup_lag)",
+          "legendFormat": "{{consumergroup}}"
         }
       ]
     },

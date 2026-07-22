@@ -1,5 +1,7 @@
 __pycache__/
 **/.DS_Store
+node_modules/
+web/dist/
 
 doc/
 

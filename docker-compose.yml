@@ -400,6 +400,66 @@ services:
     restart: unless-stopped
     networks: [data-platform]
 
+  # ──────────────────────────────────────────
+  # 10. Week 5 App 層：SSE Gateway / K 棒網站 / Discord Bot
+  #     兩個新 consumer group 各自獨立，kafka-exporter 自動產出 lag
+  # ──────────────────────────────────────────
+  web-gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway/Dockerfile
+    hostname: web-gateway
+    container_name: web-gateway
+    depends_on:
+      broker-1:
+        condition: service_healthy
+      trino:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP: broker-1:29092,broker-2:29092,broker-3:29092
+      TRINO_HOST: trino
+      TRINO_PORT: 8080
+      CHART_SYMBOL: BTCUSDT
+    restart: unless-stopped
+    networks: [data-platform]
+
+  # dev server 直接跑官方 node image（不另做 image）；node_modules 用具名 volume，
+  # 免得 mac 掛載的 ./web 蓋掉容器內裝好的相依。
+  web:
+    image: node:22-alpine
+    container_name: web
+    working_dir: /app
+    depends_on:
+      - web-gateway
+    ports:
+      - "5173:5173"
+    environment:
+      GATEWAY_URL: http://web-gateway:8000
+    volumes:
+      - ./web:/app
+      - web_node_modules:/app/node_modules
+    command: sh -c "npm install --no-audit --no-fund && npm run dev -- --host 0.0.0.0"
+    restart: unless-stopped
+    networks: [data-platform]
+
+  discord-bot:
+    build:
+      context: .
+      dockerfile: docker/bot/Dockerfile
+    container_name: discord-bot
+    depends_on:
+      broker-1:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: broker-1:29092,broker-2:29092,broker-3:29092
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID}
+      ALERT_COOLDOWN_SECS: ${ALERT_COOLDOWN_SECS:-60}
+    restart: unless-stopped
+    networks: [data-platform]
+
 # ──────────────────────────────────────────
 # Volumes
 # ──────────────────────────────────────────
@@ -408,3 +468,4 @@ volumes:
   broker_2_data:
   broker_3_data:
   minio_data:
+  web_node_modules:

@@ -1,0 +1,68 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f1115;
+  --panel: #151922;
+  --line: #1c1f26;
+  --text: #c9d1d9;
+  --hint: #7d8590;
+  --up: #26a69a;
+  --down: #ef5350;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 -apple-system, "Segoe UI", "Noto Sans TC", sans-serif;
+}
+
+.app { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+
+header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+h1 { font-size: 20px; margin: 0; letter-spacing: 0.5px; }
+h2 { font-size: 15px; margin: 0 0 10px; }
+.last { font-size: 24px; font-variant-numeric: tabular-nums; }
+.badges { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.hint { color: var(--hint); font-size: 12px; font-weight: 400; }
+
+.badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line); }
+.badge.live { color: var(--up); }
+.badge.connecting, .badge.reconnecting { color: #d29922; }
+.badge.stale { color: var(--down); border-color: var(--down); }
+
+.error { color: var(--down); background: #2a1416; border: 1px solid var(--down);
+  padding: 8px 12px; border-radius: 6px; font-size: 13px; }
+
+.chart { height: 460px; width: 100%; border: 1px solid var(--line); border-radius: 6px; }
+
+/* 寬螢幕：主圖 + 觀察清單並排；窄螢幕自動疊成一欄 */
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
+@media (max-width: 900px) { .main { grid-template-columns: minmax(0, 1fr); } }
+
+.panel { margin-top: 24px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 16px; }
+.main .panel { margin-top: 0; }
+.watchlist .scroll { max-height: 380px; overflow-y: auto; }
+.watchlist th { position: sticky; top: 0; background: var(--panel); }
+.foot { margin: 10px 0 0; }
+.empty { color: var(--hint); margin: 0; }
+
+.tag { margin-left: 6px; font-size: 11px; color: var(--hint);
+  border: 1px solid var(--line); border-radius: 8px; padding: 0 5px; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: #1b2030; }
+tbody tr.selected { background: #1d2536; }
+tbody tr.stalerow td { opacity: 0.65; }
+.up { color: var(--up); }
+.down { color: var(--down); }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+th { color: var(--hint); font-weight: 500; font-size: 12px; }
+.num { text-align: right; }
+/* 數字對齊用等寬 + tabular-nums，價量欄位不會因為字寬跳動 */
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+.sym { font-weight: 600; }
+.sigma { color: var(--down); font-weight: 600; font-variant-numeric: tabular-nums; }
