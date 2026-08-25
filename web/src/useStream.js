@@ -13,6 +13,7 @@ export const STALE_MS = 15_000
 export function useStream(symbol) {
   const [status, setStatus] = useState('connecting')
   const [alerts, setAlerts] = useState([])
+  const [priceAlerts, setPriceAlerts] = useState([])
   const [quotes, setQuotes] = useState({})
   const [lastTickAt, setLastTickAt] = useState(null)
   const tradeRef = useRef(null)          // 最新一筆成交，交給 Chart 以 imperative 方式更新
@@ -30,6 +31,9 @@ export function useStream(symbol) {
     es.addEventListener('snapshot', (e) => setAlerts(JSON.parse(e.data).reverse()))
     es.addEventListener('alert', (e) =>
       setAlerts((prev) => [JSON.parse(e.data), ...prev].slice(0, MAX_ALERTS)))
+    es.addEventListener('price_snapshot', (e) => setPriceAlerts(JSON.parse(e.data).reverse()))
+    es.addEventListener('price_alert', (e) =>
+      setPriceAlerts((prev) => [JSON.parse(e.data), ...prev].slice(0, MAX_ALERTS)))
     es.addEventListener('quotes', (e) => {
       const batch = JSON.parse(e.data)
       setQuotes((prev) => {
@@ -47,5 +51,5 @@ export function useStream(symbol) {
     return () => es.close()
   }, [symbol])
 
-  return { status, alerts, quotes, trade: tradeRef.current, tradeSeq, lastTickAt }
+  return { status, alerts, priceAlerts, quotes, trade: tradeRef.current, tradeSeq, lastTickAt }
 }

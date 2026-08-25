@@ -1,0 +1,322 @@
+# ---------------------------------------------------------------------------
+# Grafana —— 看板。
+#
+# 對照 compose：
+#   volumes: ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+#   → K8s 沒有 bind mount，整個 provisioning 目錄改用三個 ConfigMap 掛進去。
+#
+# Grafana 的 provisioning 機制：啟動時掃描 /etc/grafana/provisioning，
+# 自動建立資料來源與看板。好處是**設定進 git**——
+# 不會發生「看板只存在某人瀏覽器裡點出來的狀態」這種事。
+#
+# ⚠️ 已知限制：provisioning 建立的看板在 UI 上改了不會存回檔案，
+#    重啟就還原。要改就改這份 YAML 再 apply，這是刻意的取捨。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: streaming
+  labels:
+    app: grafana
+spec:
+  type: ClusterIP
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: streaming
+  labels:
+    app: grafana
+data:
+  prometheus.yml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        uid: PROM
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+    # ↑ uid: PROM 是刻意固定的。看板的 JSON 用
+    #   "datasource": {"uid": "PROM"} 引用它——
+    #   讓 Grafana 自動產生 uid 的話，每次重建都不同，看板會找不到資料來源
+    #   （症狀是每個 panel 顯示 "Datasource PROM was not found"）。
+    #
+    #   url 用 Service 名稱 http://prometheus:9090。
+    #   compose 版本也是這樣寫，剛好不用改——因為兩邊的服務名一樣。
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: streaming
+  labels:
+    app: grafana
+data:
+  dashboards.yml: |
+    apiVersion: 1
+    providers:
+      - name: pipeline
+        type: file
+        options:
+          path: /var/lib/grafana/dashboards
+    # ↑ 路徑跟 compose 不同（compose 是 /etc/grafana/provisioning/dashboards）。
+    #   原因：provider 設定檔和看板 JSON 必須分開掛，
+    #   而 K8s 的 ConfigMap 掛載會蓋掉整個目錄——
+    #   兩者放同一個目錄的話，第二個掛載會蓋掉第一個。
+    #   把看板挪到 /var/lib/grafana/dashboards 就沒有衝突。
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: streaming
+  labels:
+    app: grafana
+data:
+  pipeline.json: |
+    {
+      "uid": "pipeline-core",
+      "title": "Pipeline Core (Week 4)",
+      "schemaVersion": 39,
+      "editable": true,
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
+      "refresh": "15s",
+      "panels": [
+        {
+          "id": 1,
+          "title": "Consumer lag (by group)",
+          "type": "timeseries",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PROM"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 0
+          },
+          "targets": [
+            {
+              "expr": "sum by (consumergroup) (kafka_consumergroup_lag)",
+              "legendFormat": "{{consumergroup}}"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "title": "Checkpoint duration & size",
+          "type": "timeseries",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PROM"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 0
+          },
+          "targets": [
+            {
+              "expr": "flink_jobmanager_job_lastCheckpointDuration",
+              "legendFormat": "{{job_name}} duration (ms)"
+            },
+            {
+              "expr": "flink_jobmanager_job_lastCheckpointSize",
+              "legendFormat": "{{job_name}} size (bytes)"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms",
+              "custom": {
+                "axisPlacement": "left"
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/.*size \\(bytes\\)$/"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "bytes"
+                  },
+                  {
+                    "id": "custom.axisPlacement",
+                    "value": "right"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": 3,
+          "title": "Watermark lag (source operator)",
+          "type": "timeseries",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PROM"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 8
+          },
+          "targets": [
+            {
+              "expr": "time()*1000 - max(flink_taskmanager_job_task_operator_currentOutputWatermark > 0)",
+              "legendFormat": "watermark lag (ms)"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "title": "Records / sec (source)",
+          "type": "timeseries",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PROM"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 8
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(flink_taskmanager_job_task_operator_numRecordsOutPerSecond[1m]))",
+              "legendFormat": "records/s"
+            }
+          ]
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: streaming
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+
+  template:
+    metadata:
+      labels:
+        app: grafana
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+    spec:
+      enableServiceLinks: false
+
+      # ✅ 實測（2026-08-26）：
+      #      kubectl run tmp --rm -i --restart=Never \
+      #        --image=grafana/grafana:11.5.1 --command -- id
+      #      → uid=472(grafana) gid=0(root) groups=0(root)
+      #
+      # ⚠️ 我原本寫 runAsGroup: 472 / fsGroup: 472——**gid 猜錯了**。
+      #    Grafana 官方 image 用 uid 472 但 **gid 0**，
+      #    這是 OpenShift 相容的慣例（任意 uid + group 0 都能讀寫 image 內的檔案）。
+      #    設成 472 的話 process 會進到一個對 image 檔案沒有權限的群組，
+      #    症狀是啟動時各種 permission denied，而且訊息指向的是
+      #    Grafana 自己的目錄，很難聯想到是 runAsGroup 寫錯。
+      #
+      #    這是今天第二次「照慣例寫 uid 然後猜錯」。第一次是 iceberg-rest
+      #    （寫 root、實際 1000），換來一輪 CrashLoopBackOff；
+      #    這次因為先跑了 `id` 才發現，成本是零。
+      securityContext:
+        runAsUser: 472
+        runAsGroup: 0
+        fsGroup: 0
+
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.5.1
+
+          env:
+            # 沿用 compose 的設定：不用登入，直接看。
+            # PoC 而且沒有對外（無 Ingress、無 LoadBalancer，只能 port-forward），
+            # 風險可接受。Week 9-6 安全檢查會再確認一次沒有對外路徑。
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: "Admin"
+
+          ports:
+            - name: http
+              containerPort: 3000
+
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+            - name: data
+              mountPath: /var/lib/grafana/plugins
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 384Mi
+
+          # /api/health 回 JSON，但 Grafana 的 probe 只看狀態碼不看內容，
+          # 所以沒問題。（跟 gateway 那個情況不同——
+          # 那裡的問題是 Prometheus 要 parse 內容。）
+          startupProbe:
+            httpGet: { path: /api/health, port: http }
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+            periodSeconds: 15
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /api/health, port: http }
+            periodSeconds: 30
+            failureThreshold: 3
+
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards
+        # 看板與資料來源都由 provisioning 產生，不需要持久化。
+        # Grafana 仍需要一個可寫的目錄放 plugin 快取等雜物。
+        - name: data
+          emptyDir: {}

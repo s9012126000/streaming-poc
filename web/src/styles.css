@@ -1,12 +1,18 @@
+/* 顏色只在這裡定義一份，Chart.jsx 用 getComputedStyle 讀同一組變數，
+   不要在 JS 裡再抄一次 hex，否則換色時圖表會留在舊配色。 */
 :root {
-  color-scheme: dark;
-  --bg: #0f1115;
-  --panel: #151922;
-  --line: #1c1f26;
-  --text: #c9d1d9;
-  --hint: #7d8590;
-  --up: #26a69a;
-  --down: #ef5350;
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --line: #dfe3e8;
+  --text: #1c2128;
+  --hint: #5b6570;
+  /* 漲跌色比 K 棒的 #26a69a / #ef5350 深一階：那兩個是大面積色塊，
+     這兩個要當 12px 文字用，在白底上得撐得住對比度。 */
+  --up: #0a7568;
+  --down: #c62828;
+  /* 參考線用（累積 VWAP）：刻意避開漲跌的紅綠，才不會被讀成方向 */
+  --accent: #6f42c1;
 }
 
 * { box-sizing: border-box; }
@@ -29,31 +35,48 @@ h2 { font-size: 15px; margin: 0 0 10px; }
 
 .badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line); }
 .badge.live { color: var(--up); }
-.badge.connecting, .badge.reconnecting { color: #d29922; }
+.badge.connecting, .badge.reconnecting { color: #9a6700; }
 .badge.stale { color: var(--down); border-color: var(--down); }
 
-.error { color: var(--down); background: #2a1416; border: 1px solid var(--down);
+.error { color: #a11d1d; background: #fdf0f0; border: 1px solid var(--down);
   padding: 8px 12px; border-radius: 6px; font-size: 13px; }
 
-.chart { height: 460px; width: 100%; border: 1px solid var(--line); border-radius: 6px; }
+/* 高度交給 .main 的列高，兩欄的內容區才會等高 */
+.chart { flex: 1; min-height: 0; width: 100%; }
 
-/* 寬螢幕：主圖 + 觀察清單並排；窄螢幕自動疊成一欄 */
-.main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
+/* 寬螢幕：主圖 + 觀察清單並排；窄螢幕自動疊成一欄。
+   固定列高 + stretch：兩張表的上下緣才對得齊，不會被 h2/註腳的高度差推歪 */
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 16px;
+  align-items: stretch; grid-auto-rows: 460px; }
 @media (max-width: 900px) { .main { grid-template-columns: minmax(0, 1fr); } }
 
 .panel { margin-top: 24px; background: var(--panel); border: 1px solid var(--line);
-  border-radius: 6px; padding: 16px; }
+  border-radius: 6px; padding: 16px; display: flex; flex-direction: column; }
 .main .panel { margin-top: 0; }
-.watchlist .scroll { max-height: 380px; overflow-y: auto; }
+.watchlist .scroll { flex: 1; min-height: 0; overflow-y: auto; }
+.picker { width: 100%; margin-bottom: 10px; font: inherit; font-size: 13px;
+  padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.unpin { font: inherit; line-height: 1; color: var(--hint); background: none;
+  border: 0; padding: 0 2px; cursor: pointer; }
+.unpin:hover { color: var(--down); }
 .watchlist th { position: sticky; top: 0; background: var(--panel); }
 .foot { margin: 10px 0 0; }
 .empty { color: var(--hint); margin: 0; }
 
+/* 面板標題右側的次要動作按鈕。用 float 而不是把 h2 改成 flex：其他面板的
+   標題排版就不會被連帶動到。 */
+.ghost { float: right; font: inherit; font-size: 12px; font-weight: 400;
+  color: var(--hint); background: none; border: 1px solid var(--line);
+  border-radius: 6px; padding: 1px 8px; cursor: pointer; }
+.ghost:hover { color: var(--text); border-color: var(--hint); }
+
+/* symbol + 來源標籤不換行，欄寬只給它需要的，其餘讓給數字欄 */
+.watchlist td:first-child { white-space: nowrap; width: 1%; }
 .tag { margin-left: 6px; font-size: 11px; color: var(--hint);
   border: 1px solid var(--line); border-radius: 8px; padding: 0 5px; }
 tbody tr { cursor: pointer; }
-tbody tr:hover { background: #1b2030; }
-tbody tr.selected { background: #1d2536; }
+tbody tr:hover { background: #f0f2f5; }
+tbody tr.selected { background: #e6edf7; }
 tbody tr.stalerow td { opacity: 0.65; }
 .up { color: var(--up); }
 .down { color: var(--down); }

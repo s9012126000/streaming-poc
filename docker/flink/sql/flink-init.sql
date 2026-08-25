@@ -64,6 +64,7 @@ CREATE TABLE kafka_alerts_sink (
   mean         DOUBLE,
   stddev       DOUBLE,
   sigma        DOUBLE,
+  price_chg    DOUBLE,
   alert_ts     TIMESTAMP(3)
 ) WITH (
   'connector'                    = 'kafka',

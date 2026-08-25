@@ -1,0 +1,214 @@
+# ---------------------------------------------------------------------------
+# Flink JobManager
+#
+# 為什麼是 Deployment 而不是 StatefulSet：
+#   JobManager 的狀態（checkpoint metadata、job graph）都寫在 S3（MinIO），
+#   本地磁碟只有暫存。pod 重建後從 S3 恢復，副本可互換 → Deployment。
+#
+# 選型：Standalone 而非 Kubernetes Operator。
+#   理由見 week6-decisions.md——當初是 8 vCPU 太緊。
+#   現在 3 台 node 有約 11.76 vCPU，其實放得下 Operator，
+#   但那會把「Job 提交」整個換成 CRD 模式，變動太大，留待日後。
+# ---------------------------------------------------------------------------
+
+# --- Service：TaskManager 和 submit Job 都靠它找到 JobManager -------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager
+  namespace: streaming
+  labels:
+    app: flink
+    component: jobmanager
+spec:
+  type: ClusterIP
+  selector:
+    app: flink
+    component: jobmanager
+  ports:
+    - name: rpc
+      port: 6123
+      targetPort: rpc
+    - name: blob
+      port: 6124
+      targetPort: blob
+    - name: ui            # REST API + Web Dashboard
+      port: 8081
+      targetPort: ui
+    - name: metrics
+      port: 9249
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-jobmanager
+  namespace: streaming
+  labels:
+    app: flink
+    component: jobmanager
+spec:
+  replicas: 1
+  # 仍是單副本，但**已開啟 Kubernetes HA**（2026-08-25 修正）。
+  #
+  # 這兩件事常被混為一談，其實是分開的：
+  #   - replicas > 1  → 熱備援，主的掛了秒級接手
+  #   - HA services   → 狀態持久化，pod 重建後能把 job 撿回來
+  #
+  # 我們要的是後者。原本的註解說「PoC 接受掛掉重建約 60 秒」——
+  # 那句話假設「重建之後 job 還在」，但 standalone 無 HA 時
+  # job graph 只在記憶體，重建＝4 個 job 永久消失。8/25 就是這樣壞的。
+  strategy:
+    type: Recreate      # 避免新舊 JobManager 同時存在造成 job 重複
+
+  selector:
+    matchLabels:
+      app: flink
+      component: jobmanager
+
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: jobmanager
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9249"
+    spec:
+      # ★ 必須關掉。
+      # Service 叫 flink-jobmanager → K8s 注入 FLINK_JOBMANAGER_PORT=tcp://...
+      # 而 Flink 的設定變數前綴正好是 FLINK_*，撞名的風險和 Week 7
+      # Schema Registry 那次一模一樣。這次是預防，不是事後補救。
+      enableServiceLinks: false
+
+      # HA 要讀寫 ConfigMap 與 Lease，default ServiceAccount 在 GKE
+      # 沒有任何 API 權限 → 見 flink-rbac.yaml
+      serviceAccountName: flink
+
+      terminationGracePeriodSeconds: 30
+
+      # --- 等 Kafka / MinIO / iceberg-rest 都在 ---------------------
+      initContainers:
+        - name: wait-deps
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              check() {
+                for i in $(seq 1 60); do
+                  if curl -sf "$2" >/dev/null 2>&1; then
+                    echo "  ✅ $1"; return 0
+                  fi
+                  [ $((i % 10)) -eq 0 ] && echo "  ...等 $1（第 ${i} 次）"
+                  sleep 2
+                done
+                echo "  ❌ $1 逾時"; return 1
+              }
+              echo "檢查依賴 ..."
+              check "MinIO"        "http://minio:9000/minio/health/ready"
+              check "iceberg-rest" "http://iceberg-rest:8181/v1/config"
+              check "schema-registry" "http://schema-registry:8081/subjects"
+              echo "全部就緒"
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+
+      containers:
+        - name: jobmanager
+          image: asia-east1-docker.pkg.dev/project-ea92bc23-509c-459a-a30/streaming-poc/flink:latest
+          imagePullPolicy: Always
+          args: ["jobmanager"]
+
+          ports:
+            - name: rpc
+              containerPort: 6123
+            - name: blob
+              containerPort: 6124
+            - name: ui
+              containerPort: 8081
+            - name: metrics
+              containerPort: 9249
+
+          env:
+            # Flink 的 S3 檔案系統讀這兩個標準 AWS 變數
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef: { name: streaming-secrets, key: MINIO_ROOT_USER }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: streaming-secrets, key: MINIO_ROOT_PASSWORD }
+
+            # FLINK_PROPERTIES 是 apache/flink image 的慣例：
+            # 內容會被附加到 flink-conf.yaml。
+            #
+            # ⚠️ 注意：這裡是設定的**唯一來源**。
+            #    k8s/30-compute/flink-configmap.yaml 定義的 flink-common
+            #    目前沒有任何地方引用（沒有 envFrom、沒有 volume 掛載），
+            #    改那份不會有任何效果。
+            #
+            # --- HA 四行的作用（2026-08-25 新增）----------------------
+            #   high-availability.type: kubernetes
+            #       用 K8s 的 ConfigMap + Lease 當 HA 後端。
+            #       另一個選項是 zookeeper——那要多養一個 ZK 叢集，
+            #       在 K8s 上沒有理由這樣做。
+            #   high-availability.storageDir
+            #       ★ 這裡才是真正的資料。ConfigMap 有 1MB 上限，
+            #         放不下 job graph 本體，所以 Flink 把本體寫到 S3、
+            #         ConfigMap 裡只存一個指標。兩者缺一都無法復原。
+            #   kubernetes.cluster-id
+            #       HA 物件的命名前綴。**改掉它等於換一個新叢集**，
+            #       舊的 job 就找不回來了——當成穩定識別碼看待。
+            #   kubernetes.namespace
+            #       預設是 "default"，不設會去別的 namespace 找 ConfigMap
+            #       然後因為沒權限而失敗。
+            - name: FLINK_PROPERTIES
+              value: |
+                jobmanager.rpc.address: flink-jobmanager
+                jobmanager.memory.process.size: 1400m
+                rest.address: 0.0.0.0
+                rest.bind-address: 0.0.0.0
+                high-availability.type: kubernetes
+                high-availability.storageDir: s3://warehouse/flink-ha
+                kubernetes.cluster-id: streaming-poc-flink
+                kubernetes.namespace: streaming
+                state.backend: rocksdb
+                state.backend.rocksdb.memory.managed: true
+                state.checkpoints.dir: s3://warehouse/checkpoints
+                state.savepoints.dir: s3://warehouse/savepoints
+                s3.endpoint: http://minio.streaming.svc.cluster.local:9000
+                s3.path.style.access: true
+                execution.checkpointing.interval: 60s
+                execution.checkpointing.min-pause: 10s
+                execution.checkpointing.mode: EXACTLY_ONCE
+                execution.checkpointing.max-concurrent-checkpoints: 2
+                execution.checkpointing.timeout: 60s
+                table.exec.source.idle-timeout: 30s
+                metrics.reporter.prometheus.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+                metrics.reporter.prometheus.port: 9249
+
+          resources:
+            requests:
+              cpu: 300m
+              memory: 1792Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          # ⚠️ jobmanager.memory.process.size (1400m) 必須明顯小於
+          #    limits.memory (2Gi)。Flink 的 process.size 只算 JVM 相關，
+          #    容器還要放 RocksDB 的堆外記憶體、執行緒堆疊、glibc 開銷。
+          #    設太接近就是週期性 OOMKilled，而且日誌不會說是記憶體問題。
+
+          # / 是 Web Dashboard 首頁，compose 的 healthcheck 也是打這裡
+          startupProbe:
+            httpGet: { path: /, port: ui }
+            periodSeconds: 5
+            failureThreshold: 36      # 最多 3 分鐘（JVM + plugin 載入慢）
+          readinessProbe:
+            httpGet: { path: /, port: ui }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /, port: ui }
+            periodSeconds: 30
+            failureThreshold: 3

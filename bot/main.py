@@ -1,9 +1,9 @@
 # bot/main.py
-"""Discord bot: pushes market-alerts 3-sigma volume anomalies to one channel.
+"""Discord bot: pushes market-price-alerts price jumps to one channel.
 
 Own consumer group (discord-bot-consumer) so it stays up when the web gateway is
 down — and so Grafana shows its lag as a separate curve. Pure display consumer:
-the 3-sigma decision belongs to the Flink job, never to this process.
+the median+MAD 判定 belongs to the Flink job, never to this process.
 
 Run:          python -m bot.main
 Self-check:   python -m bot.main --selfcheck   (no Discord token needed)
@@ -14,7 +14,7 @@ import os
 import sys
 import time
 
-from utils.alerts import TOPIC, format_alert, parse_alert
+from utils.alerts import PRICE_TOPIC, format_price_alert, parse_price_alert
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -45,8 +45,8 @@ async def _pump(channel):
         "group.id": CONSUMER_GROUP,
         "auto.offset.reset": "latest",
     })
-    consumer.subscribe([TOPIC])
-    logger.info(f"[BOT] 🟢 consuming {TOPIC} as {CONSUMER_GROUP} | 冷卻 {COOLDOWN_SECS}s")
+    consumer.subscribe([PRICE_TOPIC])
+    logger.info(f"[BOT] 🟢 consuming {PRICE_TOPIC} as {CONSUMER_GROUP} | 冷卻 {COOLDOWN_SECS}s")
 
     last_push: dict = {}
     pushed = skipped = 0
@@ -60,12 +60,12 @@ async def _pump(channel):
                 logger.warning(f"[BOT] kafka error: {msg.error()}")
                 continue
 
-            alert = parse_alert(msg.value())
+            alert = parse_price_alert(msg.value())
             if alert is None:
                 continue
 
             if should_push(last_push, alert, time.monotonic()):
-                await channel.send(format_alert(alert))
+                await channel.send(format_price_alert(alert))
                 pushed += 1
                 logger.info(f"[BOT] 📤 pushed {alert['symbol']} | pushed={pushed} skipped={skipped}")
             else:

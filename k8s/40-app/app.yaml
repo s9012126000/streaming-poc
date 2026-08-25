@@ -1,0 +1,331 @@
+# ---------------------------------------------------------------------------
+# App 層：Gateway + Web + Bot
+#
+# 三個都是無狀態 Deployment，但依賴不同：
+#   gateway → Kafka（即時報價）+ Trino（歷史 K 線）
+#   web     → gateway（經 nginx 反向代理）
+#   bot     → Kafka（讀 market-alerts）+ Discord API（對外）
+#
+# 對外存取：全部維持 ClusterIP + port-forward。
+# Bot 走 outbound WebSocket 連 Discord，不需要 inbound，
+# 所以整個 Week 8 可以不裝 Ingress（省每月約 $18 的 LB 費用）。
+# ---------------------------------------------------------------------------
+
+# ═══════════════════════════════════════════════════════════════
+# Gateway
+# ═══════════════════════════════════════════════════════════════
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: streaming
+  labels:
+    app: gateway
+spec:
+  type: ClusterIP
+  selector:
+    app: gateway
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: streaming
+  labels:
+    app: gateway
+spec:
+  replicas: 1
+  # ⚠️ 單副本是刻意的。
+  #   gateway 在記憶體裡維護 _alert_history / _price_history / _quotes，
+  #   新連上的 SSE client 會先收到這份快照。
+  #   多副本的話每個副本各自累積不同的歷史，使用者重新整理頁面
+  #   可能連到另一個副本、看到不一樣的資料。
+  #   要多副本得先把那些狀態外推（例如放 Redis），那是另一個工程。
+  selector:
+    matchLabels:
+      app: gateway
+
+  template:
+    metadata:
+      labels:
+        app: gateway
+      # ⚠️ 2026-08-26：拿掉了 prometheus.io/* 註記。原本是——
+      #      prometheus.io/scrape: "true"
+      #      prometheus.io/port:   "8000"
+      #      prometheus.io/path:   "/api/health"
+      #
+      #    /api/health 回的是 JSON，不是 Prometheus 的文字格式。
+      #    Prometheus 抓到之後會 parse 失敗，那個 target 永遠是紅的：
+      #      "expected a valid start token, got \"{\""
+      #    ——不會讓任何東西壞掉，但 /targets 會一直有一項 DOWN，
+      #    而 Week 9 的驗收標準正是「所有 target 都 UP」。
+      #    留著等於讓驗收標準永遠達不到，只好每次人工忽略一項；
+      #    這種「已知可忽略的紅燈」是告警疲勞的起點。
+      #
+      #    要恢復的話，gateway 得先真的提供 Prometheus 格式的端點
+      #    （像 producer 的 healthz.py 那樣）。已列在待辦池。
+      #    在那之前，gateway 的健康由 Week 9 從外部判斷。
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+
+      initContainers:
+        - name: wait-deps
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              echo "等待 Kafka bootstrap ..."
+              for i in $(seq 1 60); do
+                # 用 TCP 檢查——curl 打不了 Kafka 的二進位協定
+                if nc -z kafka-bootstrap 9092 2>/dev/null; then
+                  echo "Kafka 可達（第 ${i} 次）"; exit 0
+                fi
+                [ $((i % 10)) -eq 0 ] && echo "  第 ${i} 次仍未就緒"
+                sleep 2
+              done
+              echo "❌ 等待逾時"; exit 1
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+
+      containers:
+        - name: gateway
+          image: asia-east1-docker.pkg.dev/project-ea92bc23-509c-459a-a30/streaming-poc/gateway:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8000
+
+          envFrom:
+            - configMapRef:
+                name: app-config      # KAFKA_BOOTSTRAP / TRINO_HOST / TRINO_PORT / CHART_SYMBOL
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 320Mi
+            limits:
+              cpu: 500m
+              memory: 640Mi
+
+          # /api/health 不接觸 Trino 或 Kafka，只回內部計數器——
+          # 正是 liveness 該用的端點（只問「這個 process 還活著嗎」）。
+          startupProbe:
+            httpGet: { path: /api/health, port: http }
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /api/health, port: http }
+            periodSeconds: 30
+            failureThreshold: 3
+
+---
+# ═══════════════════════════════════════════════════════════════
+# Web（靜態檔 + nginx 反向代理）
+# ═══════════════════════════════════════════════════════════════
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: streaming
+  labels:
+    app: web
+spec:
+  type: ClusterIP
+  selector:
+    app: web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: streaming
+  labels:
+    app: web
+spec:
+  replicas: 2
+  # web 是真正無狀態的（純靜態檔 + 代理），可以多副本。
+  # 這也是整套系統裡唯一適合掛 HPA 的服務。
+  selector:
+    matchLabels:
+      app: web
+
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      enableServiceLinks: false
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: web
+
+      containers:
+        - name: web
+          image: asia-east1-docker.pkg.dev/project-ea92bc23-509c-459a-a30/streaming-poc/web:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8080   # nginx.conf 用 8080（非特權埠）
+
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          # nginx 只送靜態檔和代理，資源需求極小。
+          # 這是兩階段 build 的回報——image 約 50MB，跑起來也輕。
+
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 3
+            failureThreshold: 10
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 30
+            failureThreshold: 3
+
+---
+# ═══════════════════════════════════════════════════════════════
+# Discord Bot
+# ═══════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bot
+  namespace: streaming
+  labels:
+    app: bot
+spec:
+  replicas: 1
+  # ⚠️ 一定是 1。多副本會讓同一則告警被送到 Discord 多次——
+  #   兩個副本各自是獨立的 Kafka consumer group 成員，
+  #   但 bot 讀的是全部分區的告警（不是分工消費）。
+  strategy:
+    type: Recreate     # 避免滾動更新期間新舊並存造成重複告警
+
+  selector:
+    matchLabels:
+      app: bot
+
+  template:
+    metadata:
+      labels:
+        app: bot
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+
+      initContainers:
+        - name: wait-kafka
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              echo "等待 Kafka bootstrap ..."
+              for i in $(seq 1 60); do
+                if nc -z kafka-bootstrap 9092 2>/dev/null; then
+                  echo "Kafka 可達（第 ${i} 次）"; exit 0
+                fi
+                [ $((i % 10)) -eq 0 ] && echo "  第 ${i} 次仍未就緒"
+                sleep 2
+              done
+              echo "❌ 等待逾時"; exit 1
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+
+      containers:
+        - name: bot
+          image: asia-east1-docker.pkg.dev/project-ea92bc23-509c-459a-a30/streaming-poc/bot:latest
+          imagePullPolicy: Always
+
+          envFrom:
+            - configMapRef:
+                name: app-config      # KAFKA_BOOTSTRAP
+
+          env:
+            - name: DISCORD_TOKEN
+              valueFrom:
+                secretKeyRef: { name: streaming-secrets, key: DISCORD_TOKEN }
+            - name: DISCORD_CHANNEL_ID
+              valueFrom:
+                secretKeyRef: { name: streaming-secrets, key: DISCORD_CHANNEL_ID }
+            - name: ALERT_COOLDOWN_SECS
+              value: "60"
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: 300m
+              memory: 384Mi
+
+          # ⚠️ 2026-08-25：liveness probe 已移除。原本是——
+          #
+          #      livenessProbe:
+          #        exec:
+          #          command: ["sh", "-c", "pgrep -f 'bot.main' > /dev/null"]
+          #        initialDelaySeconds: 30
+          #        periodSeconds: 30
+          #        failureThreshold: 3
+          #
+          #    它把一個完全健康的 bot 殺了 26 次。
+          #
+          #    直接原因：image 是 python:3.12-slim，**不含 procps，沒有 pgrep**。
+          #      Liveness probe failed: sh: 1: pgrep: not found
+          #      Container bot failed liveness probe, will be restarted
+          #    時間對得分毫不差：
+          #      initialDelay 30 + 3 × period 30 = 120s → SIGTERM
+          #      + terminationGracePeriod 30        = 150s → SIGKILL (exit 137)
+          #      實測 03:07:10 → 03:09:39 = 149 秒
+          #    退出碼 137 配 Reason: Error（不是 OOMKilled）就是這個特徵。
+          #
+          #    ★ 但更根本的問題是：**就算 pgrep 存在，這個 probe 也沒有意義。**
+          #      CMD 用 exec form，所以 python 就是 PID 1。
+          #      PID 1 死掉時容器本來就會結束，輪不到 probe 來發現。
+          #      也就是說它只有兩種結果：永遠通過，或因為工具不存在而永遠失敗。
+          #      恰好落在後者。
+          #
+          #    「弱訊號的 probe」不是「聊勝於無」——它只有下行風險。
+          #    沒有 probe，壞掉的 bot 會安靜地不工作；
+          #    有壞的 probe，好好的 bot 會被反覆殺掉。後者嚴重得多。
+          #
+          #    真正的解法是像 producer 那樣加 /healthz + 心跳
+          #    （bot 有在消費 Kafka 才更新心跳時間）。
+          #    那是應用程式碼變更，已列在待辦池。
+          #
+          #    在那之前，bot 的健康由 Week 9 的 Prometheus 從外部判斷——
+          #    「market-alerts 有訊息進來但 Discord 沒動靜」才是有意義的訊號。
+          #
+          # 沒有 readinessProbe 也是刻意的：bot 只有 outbound 連線，
+          # 沒有任何 Service 指向它，Ready 與否不影響流量導向。

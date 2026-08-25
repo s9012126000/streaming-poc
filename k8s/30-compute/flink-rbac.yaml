@@ -1,0 +1,78 @@
+# ---------------------------------------------------------------------------
+# Flink Kubernetes HA 的權限
+#
+# 2026-08-25 新增。起因見 week8-decisions.md「坑 6」。
+#
+# 為什麼需要這個：
+#   standalone session cluster 的 job graph 只存在 JobManager 的記憶體裡。
+#   JM 一重啟，日誌會出現這句——
+#       Successfully recovered 0 persisted job graphs.
+#   ——然後 4 個 job 就永遠消失了，MinIO 裡的 checkpoint 變成孤兒，
+#   沒有任何東西會自動去 resume。
+#
+#   開了 Kubernetes HA 之後，Flink 會把「有哪些 job、每個 job 最近的
+#   checkpoint 在哪、誰是 leader」寫進 K8s 的 ConfigMap 與 Lease。
+#   JM 重建後從那裡讀回來，自動從 checkpoint 續跑。
+#
+#   而要讀寫那些物件，pod 就不能再用 default ServiceAccount——
+#   default 在 GKE 是**沒有任何 API 權限**的。
+#
+# 為什麼是 Role 而不是 ClusterRole：
+#   Flink 只需要操作自己 namespace 內的物件。用 namespace 級的 Role
+#   把爆炸半徑限制在 streaming 裡，這也是 Week 9 安全檢查會看的項目。
+#
+# ⚠️ HA 的 ConfigMap **刻意不設 ownerReference**，所以 `kubectl delete
+#    deploy/flink-jobmanager` 不會連帶刪掉它們——這正是「刪了叢集還能
+#    復原 job」的原理。副作用是想真正從頭來過時要手動清：
+#      kubectl delete cm -n streaming -l app=flink,configmap-type=high-availability
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flink
+  namespace: streaming
+  labels:
+    app: flink
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: flink-ha
+  namespace: streaming
+  labels:
+    app: flink
+rules:
+  # HA 中繼資料（job graph 指標、checkpoint 指標）存在 ConfigMap
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+
+  # Leader 選舉。Flink 1.16 之後改用 coordination.k8s.io 的 Lease，
+  # 不再是「靠 ConfigMap 的 annotation 搶鎖」的舊做法。
+  # 只給 configmaps 而漏掉 leases 的話，JM 會起來但選不出 leader，
+  # 症狀是 REST 一直 503、日誌重複刷 leader election 相關的錯誤。
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+
+  # Flink 的 K8s client 啟動時會查自己所在的 pod 以確認 cluster 資訊。
+  # 唯讀就夠。
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: flink-ha
+  namespace: streaming
+  labels:
+    app: flink
+subjects:
+  - kind: ServiceAccount
+    name: flink
+    namespace: streaming
+roleRef:
+  kind: Role
+  name: flink-ha
+  apiGroup: rbac.authorization.k8s.io

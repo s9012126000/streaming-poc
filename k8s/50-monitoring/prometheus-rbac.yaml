@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------------------
+# Prometheus 的服務發現權限
+#
+# 為什麼需要：kubernetes_sd_configs 的運作方式是「呼叫 K8s API 列出 pod，
+# 從中挑出有 prometheus.io/scrape 註記的」。要列 pod 就要有權限，
+# 而 GKE 的 default ServiceAccount 對 API 沒有任何權限。
+#
+# ⚠️ 權限不足時的症狀特別難認：
+#   Prometheus **正常啟動**，Web UI 打得開，
+#   只有 /targets 頁面是空的——看起來像「還沒發現任何目標」，
+#   而不像「權限被拒」。真正的錯誤只在 Prometheus 自己的日誌裡：
+#     "Failed to list *v1.Pod: pods is forbidden: User
+#      system:serviceaccount:streaming:prometheus cannot list resource pods"
+#
+# 為什麼是 Role 而不是 ClusterRole：
+#   多數教學都給 ClusterRole（因為預設要監控整個叢集）。
+#   我們只監控 streaming 這一個 namespace，所以用 namespace 級的 Role，
+#   再在 prometheus.yml 的 kubernetes_sd_configs 裡指定
+#       namespaces: { names: [streaming] }
+#   兩邊要一致——只縮 Role 而沒縮 SD 設定的話，
+#   Prometheus 會嘗試列出全叢集的 pod 然後被拒。
+#
+#   這樣做的好處是 Week 9-6 安全檢查時，這個服務帳戶的爆炸半徑
+#   限制在單一 namespace 內，不需要額外解釋。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: streaming
+  labels:
+    app: prometheus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus-sd
+  namespace: streaming
+  labels:
+    app: prometheus
+rules:
+  # role: pod 的服務發現只需要 pods。
+  # services / endpoints 是給 role: service / role: endpoints 用的，
+  # 我們不用那兩種——一併列出來是為了日後想改發現方式時不用回來翻文件。
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  # ConfigMap 唯讀：不是服務發現需要，是為了讓 Prometheus 能重讀
+  # 自己的設定（我們用 volume 掛載，其實不需要，但留著無害）。
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus-sd
+  namespace: streaming
+  labels:
+    app: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: streaming
+roleRef:
+  kind: Role
+  name: prometheus-sd
+  apiGroup: rbac.authorization.k8s.io

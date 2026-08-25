@@ -2,7 +2,7 @@
 """SSE gateway: fans out market-alerts + market-trades-clean to browsers, and
 serves the Trino kline backfill.
 
-Display layer only — the 3-sigma decision lives in the Flink job. This service
+Display layer only — the median+MAD 判定 lives in the Flink job. This service
 parses, filters by symbol and forwards; it never re-derives a signal.
 
 Fan-out shape (see doc/week5/PLAN.md §5):
@@ -25,7 +25,7 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 
 from gateway.kline_sql import fetch_klines, fetch_symbols
-from utils.alerts import parse_alert
+from utils.alerts import PRICE_TOPIC, TOPIC, parse_alert, parse_price_alert
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -41,6 +41,9 @@ QUOTE_SECS      = 1.0   # watchlist 用不到逐筆：每秒推一次「有變�
 
 _subscribers: dict[asyncio.Queue, str] = {}   # queue -> 該連線正在看的 symbol
 _alert_history: deque = deque(maxlen=ALERT_HISTORY)
+# 價格跳躍另外存一條：跳躍比量能異常稀有得多（約 0.1% 的 bar），
+# 混在同一個 buffer 裡會被成交量告警洗掉。
+_price_history: deque = deque(maxlen=ALERT_HISTORY)
 _quotes: dict[str, dict] = {}                 # symbol -> 最新價（watchlist 快照）
 _dirty: set[str] = set()                      # 上次推播後有變動的 symbol
 _stop = threading.Event()
@@ -58,6 +61,13 @@ def _on_alert(alert: dict):
     _alert_history.append(alert)
     for q in _subscribers:
         _send(q, "alert", alert)
+
+
+def _on_price_alert(alert: dict):
+    """Runs on the event loop thread."""
+    _price_history.append(alert)
+    for q in _subscribers:
+        _send(q, "price_alert", alert)
 
 
 def _on_trade(tick: dict):
@@ -78,7 +88,7 @@ def _consume(loop: asyncio.AbstractEventLoop):
         # 展示用即時資料，重啟後從最新開始；歷史 K 棒本來就走 Trino 回補
         "auto.offset.reset": "latest",
     })
-    consumer.subscribe(["market-alerts", "market-trades-clean"])
+    consumer.subscribe([TOPIC, PRICE_TOPIC, "market-trades-clean"])
     logger.info(f"[GATEWAY] 🟢 consuming as {CONSUMER_GROUP}")
 
     while not _stop.is_set():
@@ -89,10 +99,16 @@ def _consume(loop: asyncio.AbstractEventLoop):
             logger.warning(f"[GATEWAY] kafka error: {msg.error()}")
             continue
 
-        if msg.topic() == "market-alerts":
+        if msg.topic() == TOPIC:
             alert = parse_alert(msg.value())
             if alert:
                 loop.call_soon_threadsafe(_on_alert, alert)
+            continue
+
+        if msg.topic() == PRICE_TOPIC:
+            jump = parse_price_alert(msg.value())
+            if jump:
+                loop.call_soon_threadsafe(_on_price_alert, jump)
             continue
 
         try:
@@ -162,6 +178,8 @@ async def stream(symbol: str = CHART_SYMBOL):
         try:
             # 一連上先補歷史，否則剛開的頁面異常榜與 watchlist 都是空的
             _send(q, "snapshot", list(_alert_history))
+            # 跳躍另發一個事件，不動原本 snapshot 的形狀
+            _send(q, "price_snapshot", list(_price_history))
             _send(q, "quotes", list(_quotes.values()))
             while True:
                 try:
@@ -178,4 +196,5 @@ async def stream(symbol: str = CHART_SYMBOL):
 @app.get("/api/health")
 def health():
     return {"subscribers": len(_subscribers), "alerts_buffered": len(_alert_history),
+            "price_alerts_buffered": len(_price_history),
             "symbols_seen": len(_quotes), "consumer_group": CONSUMER_GROUP}

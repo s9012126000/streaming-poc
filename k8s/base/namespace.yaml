@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# 所有這個專案的東西都放在自己的 namespace，不丟 default。
+# 好處：一鍵清光（kubectl delete ns streaming）、資源配額好設、
+#       之後要看「我的東西花了多少資源」也乾淨。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: streaming
+  labels:
+    project: streaming-poc
+---
+# ResourceQuota：防呆用。
+# 沒有它的話，一個手滑的 replicas: 50 就會觸發 Spot node 擴容，帳單直接跳。
+# 上限刻意設在「比 03-check-quotas.sh 的估算稍寬」的位置。
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: streaming-quota
+  namespace: streaming
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 28Gi
+    limits.cpu: "16"
+    limits.memory: 40Gi
+    persistentvolumeclaims: "12"
+    requests.storage: 250Gi
+    services.loadbalancers: "1"   # 每條 LB 轉發規則約 $18/月，只准開一條
+---
+# LimitRange：沒寫 requests/limits 的 pod 會拿到這組預設值。
+# 驗收清單有一條「全部 pod 有 probe 與 requests/limits」——
+# 這個保證了下限，但不代表可以不寫，因為預設值不會是對的值。
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: streaming-defaults
+  namespace: streaming
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi

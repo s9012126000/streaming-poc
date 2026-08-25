@@ -15,6 +15,11 @@ export const fmtQty = (v) => (v == null ? '—' : qty.format(v))
 export const fmtSigma = (v) => (v == null ? 'n/a' : `${sigma.format(v)}σ`)
 export const fmtPct = (v) => (v == null || !isFinite(v) ? '—' : pct.format(v))
 
+// 佔比不是漲跌，不能帶正負號：「佔日均量 +1.28%」會被讀成「多了 1.28%」。
+const pctPlain = new Intl.NumberFormat('en-US', { style: 'percent',
+  minimumFractionDigits: 2, maximumFractionDigits: 2 })
+export const fmtPctPlain = (v) => (v == null || !isFinite(v) ? '—' : pctPlain.format(v))
+
 // 交易所時間一律用 UTC 顯示，並且把時區寫在畫面上，不用瀏覽器本地時區含糊帶過。
 const time = new Intl.DateTimeFormat('en-GB', {
   timeZone: 'UTC', hour: '2-digit', minute: '2-digit', second: '2-digit',

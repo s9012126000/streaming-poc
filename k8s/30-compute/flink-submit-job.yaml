@@ -1,0 +1,212 @@
+# ---------------------------------------------------------------------------
+# 提交 Flink Job —— 這是 Compose → K8s 之間最大的架構差異。
+#
+# compose 的做法是一個一次性容器跑四段指令：
+#   sql-client.sh -i flink-init.sql -f submit-jobs.sql
+#   flink run -d -py bronze_ingest.py
+#   flink run -d -py volume_anomaly.py
+#   flink run -d -py price_anomaly.py
+#
+# 搬到 K8s 要處理三件 compose 沒有的問題：
+#   1. 沒有 bind mount —— SQL 和 PyFlink 檔案改用 ConfigMap 掛進來
+#   2. 沒有 depends_on: service_healthy —— 用 initContainer 輪詢
+#   3. Job 可能重跑 —— 必須先檢查有沒有同樣的 job 在跑，否則會提交重複的
+#
+# 第 3 點在 compose 幾乎不會遇到（很少重跑 flink-init），
+# 但在 K8s 上 Job 被 Spot 中斷後會自動重試，不做冪等就會產生重複 job。
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flink-submit
+  namespace: streaming
+  labels:
+    app: flink
+    component: submit
+spec:
+  # 除錯階段設 0：失敗就停，不要重試三次浪費時間。
+  # 每次重試都要重跑 initContainer 和 sql-client，一輪好幾分鐘。
+  # 穩定之後可以調回 3（應付 Spot 中斷）。
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: submit
+    spec:
+      # ⚠️ 用 Never 而不是 OnFailure，理由是「除錯體驗」：
+      #
+      #   OnFailure → 失敗時在**同一個 pod 裡重啟容器**，
+      #               而 Job 判定失敗後 controller 會把那個 pod 刪掉。
+      #               結果就是「Job 顯示 BackoffLimitExceeded，
+      #               但 kubectl get pods 什麼都沒有」——日誌完全拿不到。
+      #
+      #   Never     → 每次重試建立**新的 pod**，失敗的 pod 全部保留。
+      #               可以逐一看每次嘗試的日誌。
+      #
+      # 代價是 namespace 裡會留下幾個 Error 狀態的 pod，
+      # 但那正是我們要看的東西。ttlSecondsAfterFinished 之後會清掉。
+      restartPolicy: Never
+      enableServiceLinks: false
+
+      # --- 等 JobManager 有足夠的 TaskManager slot -------------------
+      # 只等 JobManager 起來是不夠的——沒有 TaskManager 註冊時提交 job
+      # 會卡在 SCHEDULED 然後逾時失敗。要等到 slot 真的可用。
+      initContainers:
+        - name: wait-slots
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              echo "等待 JobManager 與 TaskManager slot ..."
+              for i in $(seq 1 90); do
+                RESP=$(curl -sf http://flink-jobmanager:8081/overview 2>/dev/null || echo "")
+                if [ -n "$RESP" ]; then
+                  # slots-total 是所有 TaskManager 註冊的 slot 總數。
+                  # 2 個 TaskManager × 2 slots = 4，至少要有 4 才提交。
+                  SLOTS=$(echo "$RESP" | sed -n 's/.*"slots-total":\([0-9]*\).*/\1/p')
+                  echo "  第 ${i} 次：slots-total=${SLOTS:-?}"
+                  [ "${SLOTS:-0}" -ge 4 ] 2>/dev/null && echo "slot 足夠，開始提交" && exit 0
+                fi
+                sleep 4
+              done
+              echo "❌ 等待逾時：slot 不足，TaskManager 可能沒起來"
+              echo "   檢查：kubectl get pods -n streaming -l component=taskmanager"
+              exit 1
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+
+      containers:
+        - name: submit
+          image: asia-east1-docker.pkg.dev/project-ea92bc23-509c-459a-a30/streaming-poc/flink:latest
+          imagePullPolicy: Always
+
+          env:
+            - name: JM
+              value: "flink-jobmanager:8081"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef: { name: streaming-secrets, key: MINIO_ROOT_USER }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: streaming-secrets, key: MINIO_ROOT_PASSWORD }
+            # 重跑時想強制重新提交（例如改了 SQL）就設 FORCE=1
+            - name: FORCE
+              value: "0"
+            # 預期的 job 總數。改了 submit-jobs.sql 或增減 PyFlink job 時要同步。
+            # 寫死一個數字不漂亮，但比「> 0 就當作沒問題」正確得多。
+            - name: EXPECTED
+              value: "4"
+
+          volumeMounts:
+            - name: flink-sql
+              mountPath: /opt/flink/sql
+              readOnly: true
+            - name: flink-jobs
+              mountPath: /opt/flink/jobs
+              readOnly: true
+
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+
+              echo "=== flink-submit 開始 ==="
+              echo "JobManager: ${JM}   FORCE=${FORCE}"
+
+              # --- 冪等性檢查 -------------------------------------------
+              # 已經有 job 在跑就跳過，除非 FORCE=1。
+              # 沒有這一段的話，Job 被 Spot 中斷重試時會再提交一輪，
+              # 變成同樣的 job 跑兩份、同時寫入同一張 Iceberg 表。
+              #
+              # ⚠️ 結尾的 `|| true` 不能省。
+              #    grep 找不到符合項時回傳 exit 1，配上 pipefail + set -e
+              #    會讓整個腳本在這裡靜默死掉——而「沒有 RUNNING 的 job」
+              #    正是第一次執行時的正常狀態。
+              #    症狀是「pod Error 但日誌完全空白」，極難聯想到是 grep。
+              RUNNING=$(curl -sf "http://${JM}/jobs" 2>/dev/null \
+                        | grep -o '"status":"RUNNING"' | wc -l | tr -d ' ' || true)
+              RUNNING="${RUNNING:-0}"
+              echo "目前 RUNNING 的 job 數：${RUNNING} / ${EXPECTED}"
+
+              # ⚠️ 2026-08-26 修正。原本的判準是 `RUNNING > 0 → 跳過`，
+              #    那沒辦法分辨「四個都在」和「只有兩個在」。
+              #    實際踩到：SQL 的兩個 job 先起來，這個檢查看到 2 就跳過，
+              #    三個 PyFlink job 完全沒提交，結果只有 3 個 job 在跑
+              #    （另一個是別的 submit pod 送的）。
+              #    而且腳本 exit 0、Job 顯示 Completed——**失敗偽裝成成功**。
+              #
+              #    現在分三種情況處理，其中「部分存在」刻意讓它失敗：
+              #    那個狀態沒有安全的自動解，重送會讓已存在的 job 變兩份。
+              if [ "${RUNNING}" -eq "${EXPECTED}" ] && [ "${FORCE}" != "1" ]; then
+                echo "✅ ${EXPECTED} 個 job 都在執行，跳過提交（冪等）"
+                curl -sf "http://${JM}/jobs/overview" | head -c 800; echo
+                exit 0
+              fi
+
+              if [ "${RUNNING}" -gt 0 ] && [ "${FORCE}" != "1" ]; then
+                echo
+                echo "❌ 部分 job 在執行（${RUNNING}/${EXPECTED}）——這個狀態需要人工判斷。"
+                echo
+                echo "   直接重送會讓已存在的 job 變成兩份，同時寫入同一張 Iceberg 表。"
+                echo "   目前的 job："
+                curl -sf "http://${JM}/jobs/overview" | head -c 1200; echo
+                echo
+                echo "   兩種處理方式："
+                echo "     A. 全部取消後重送（乾淨，但要重讀 Kafka）"
+                echo "        for jid in \$(curl -s http://${JM}/jobs | grep -o '\"id\":\"[^\"]*\"' | cut -d'\"' -f4); do"
+                echo "          curl -s -X PATCH \"http://${JM}/jobs/\${jid}?mode=cancel\"; done"
+                echo "        再跑一次 bash k8s/deploy/gcp/14-submit-flink.sh"
+                echo
+                echo "     B. 只補缺的那一個（保留現有進度）"
+                echo "        kubectl exec -n streaming deploy/flink-jobmanager -c jobmanager -- \\"
+                echo "          /opt/flink/bin/flink run -d -py /opt/flink/jobs/<缺的那支>.py"
+                echo
+                echo "   確定要全部重送就把 FORCE 設成 1。"
+                exit 1
+              fi
+
+              # --- 1. SQL 定義的 job ------------------------------------
+              # -i 是初始化腳本（catalog、表定義），-f 是要執行的腳本。
+              # 和 compose 完全一樣，只有 rest.address 指向 Service。
+              echo
+              echo "=== 提交 SQL job ==="
+              /opt/flink/bin/sql-client.sh \
+                -D rest.address=flink-jobmanager \
+                -i /opt/flink/sql/flink-init.sql \
+                -f /opt/flink/sql/submit-jobs.sql
+
+              # --- 2. PyFlink job ---------------------------------------
+              echo
+              echo "=== 提交 PyFlink job ==="
+              for job in bronze_ingest volume_anomaly price_anomaly; do
+                echo "--> ${job}"
+                /opt/flink/bin/flink run -d -m "${JM}" -py "/opt/flink/jobs/${job}.py"
+              done
+
+              # --- 3. 確認 ----------------------------------------------
+              echo
+              echo "=== 提交後的 job 狀態 ==="
+              sleep 5
+              curl -sf "http://${JM}/jobs/overview" | head -c 1200; echo
+              echo
+              echo "flink-submit 完成。"
+
+          resources:
+            requests: { cpu: 200m, memory: 768Mi }
+            limits:   { cpu: "1", memory: 1536Mi }
+
+      volumes:
+        # 由 k8s/deploy/gcp/14-submit-flink.sh 從 docker/flink/ 產生，
+        # 過程中會把 broker-N:29092 換成 kafka-bootstrap:9092
+        - name: flink-sql
+          configMap:
+            name: flink-sql
+        - name: flink-jobs
+          configMap:
+            name: flink-jobs

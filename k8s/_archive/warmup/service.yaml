@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------------------
+# 暖身 #3：Service —— 對應 Compose 的 `ports:` 與服務間互連。
+#
+# 三種類型的選擇（Week 6 驗收要求「無對外暴露的 port」，所以用 ClusterIP）：
+#
+#   ClusterIP    只有叢集內部連得到。預設值，也是絕大多數服務該用的。
+#                外部要看 → kubectl port-forward（零成本）
+#   NodePort     在每個 node 上開一個 30000-32767 的 port。
+#                要另外開防火牆，且 Spot node 換 IP 就得重找，PoC 不建議。
+#   LoadBalancer 建立一個 GCP 網路負載平衡器 → 拿到公開 IP。
+#                每條轉發規則約 $18/月，閒置也算。Week 8 才考慮，且只開一條。
+#
+# 另外：Service 的 DNS 名字是 <name>.<namespace>.svc.cluster.local，
+#       這取代了 Compose 的 network alias。ConfigMap 裡的位址就是這樣寫的。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: warmup
+  namespace: streaming
+  labels:
+    app: warmup
+spec:
+  type: ClusterIP
+  selector:
+    app: warmup        # ← 靠 label 找 pod，和 Deployment 的 selector 各自獨立。
+                       #   Service 不知道 Deployment 存在，只認 label。
+  ports:
+    - name: http
+      port: 80         # Service 對外的 port
+      targetPort: http # pod 上的 port（用名字，比寫死 8080 好維護）
+      protocol: TCP

@@ -1,0 +1,259 @@
+# ---------------------------------------------------------------------------
+# Iceberg REST Catalog
+#
+# 它是「目錄」：記錄有哪些 namespace、有哪些表、每張表現在該讀哪個
+# metadata.json。真正的 Parquet 檔案在 MinIO（「書架」）。
+#
+# ⚠️ 2026-08-25 修正 —— 這份 manifest 原本的註解是錯的。
+#
+#   原本寫：「catalog 的中繼資料本身也存在 MinIO 上 → pod 沒有狀態 →
+#            用 Deployment」
+#
+#   錯在混淆了兩層東西：
+#     - 表的 metadata.json / manifest 檔  → 確實在 MinIO
+#     - namespace → table → 目前 metadata.json 的**指標**
+#                                        → 在 catalog 自己的 DB 裡
+#
+#   tabulario image 沒設 CATALOG_URI 時，預設是
+#       jdbc:sqlite:file:/tmp/iceberg_rest_mode=memory
+#   也就是**記憶體裡的 SQLite**。pod 一重啟，「有哪些表」全部歸零，
+#   Trino 會回 "Schema 'bronze' does not exist"，而 MinIO 裡的
+#   Parquet 檔全都變成沒人指向的孤兒。
+#
+#   為什麼 compose 從沒暴露這個問題：docker-compose.yml 同樣沒設
+#   CATALOG_URI、同樣沒掛 volume，但 `restart: unless-stopped` 讓容器
+#   一直活著；而每次真的重來，flink-init.sql 的
+#   `CREATE DATABASE IF NOT EXISTS` 對著空 catalog 就變成「建立」，
+#   把症狀完全蓋掉。K8s 每天 down/up 一次，第一次出現
+#   「重啟了但沒重跑 init」的組合，缺口就露出來了。
+#
+#   → 所以它**有狀態**。8/25 的做法是把 SQLite 放到 PVC 上。
+#
+# ⚠️ 2026-08-26 再次修正 —— SQLite 撐不住。
+#
+#   8/25 的修正解決了「重啟失憶」，但隔天演練時炸出新問題：
+#       [SQLITE_BUSY] The database file is locked
+#   SQLite 是單寫者模型，兩個 Flink job 同時 commit 就有一個直接失敗，
+#   被包成 HTTP 500，Flink 收到 CommitStateUnknownException 之後
+#   進入無法自癒的重啟迴圈。
+#
+#   我當時寫的理由是「限制：只能 1 副本（SQLite 檔案鎖），
+#   但我們本來就是 replicas: 1」——**只考慮了伺服器有幾個副本，
+#   忽略了有幾個 client 同時寫**。單副本的伺服器一樣會收到並行請求。
+#
+#   → catalog 後端改成 Postgres（k8s/10-storage/catalog-postgres.yaml）。
+#     完整記錄見 doc/updated_plan/week9-decisions.md。
+#
+# 所以它現在**又變回無狀態了**：狀態全部在 catalog-db 那顆 PVC 上，
+# 這個 pod 自己沒有任何要保存的東西。PVC、fsGroup、Recreate 策略
+# 全部移除——那些是 SQLite 時期的產物。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: iceberg-rest
+  namespace: streaming
+  labels:
+    app: iceberg-rest
+spec:
+  type: ClusterIP
+  selector:
+    app: iceberg-rest
+  ports:
+    - name: http
+      port: 8181
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iceberg-rest
+  namespace: streaming
+  labels:
+    app: iceberg-rest
+spec:
+  replicas: 1
+  # 換成 Postgres 之後，這裡其實**可以**加副本了——狀態不在 pod 上，
+  # 多個 iceberg-rest 同時連同一個 Postgres 沒有問題。
+  # 維持 1 是因為現在的負載一個就夠，而且多副本要先想清楚
+  # 「commit 衝突時誰重試」——那是 Iceberg 的樂觀併發在管，
+  # 但沒實測過就不宣稱它能動。
+  #
+  # strategy 也回到預設的 RollingUpdate。
+  # 8/25 的 Recreate 是因為 RWO 的 PVC 會跟滾動更新死結，
+  # 現在沒有 PVC 了。
+
+  selector:
+    matchLabels:
+      app: iceberg-rest
+
+  template:
+    metadata:
+      labels:
+        app: iceberg-rest
+    spec:
+      # 預防性——同 schema-registry 的理由（Service 名撞上應用程式設定變數）。
+      # iceberg-rest 目前沒有已知衝突，但關掉沒有壞處，
+      # 而且少了幾十個沒用的環境變數，除錯時 printenv 乾淨很多。
+      enableServiceLinks: false
+
+      # 已移除 securityContext / fsGroup。
+      #   8/25 加它是因為 tabulario image 以 uid=1000(iceberg) 執行，
+      #   而 GKE 新建的 PVC 根目錄是 root:root 755，SQLite 寫不進去
+      #   （錯誤訊息是 SQLITE_CANTOPEN，完全看不出是權限）。
+      #   現在沒有 PVC 了，這段沒有作用。
+      #   uid 1000 這個事實仍然為真，只是不再有它寫不進去的目錄。
+
+      initContainers:
+        # 先等 catalog 資料庫。iceberg-rest 連不上 DB 時會直接退出，
+        # 不是重試——沒有這一步就是 CrashLoopBackOff。
+        - name: wait-for-catalog-db
+          image: postgres:17-alpine
+          command:
+            - sh
+            - -c
+            - |
+              echo "等待 catalog-db（最多 60 次 × 2 秒）..."
+              for i in $(seq 1 60); do
+                if pg_isready -h catalog-db -p 5432 -U iceberg -d iceberg >/dev/null 2>&1; then
+                  echo "catalog-db 已就緒（第 ${i} 次）"; exit 0
+                fi
+                [ $((i % 10)) -eq 0 ] && echo "  第 ${i} 次仍未就緒"
+                sleep 2
+              done
+              echo "❌ 等待逾時：catalog-db 連不上"; exit 1
+          # 用 postgres image 是為了拿 pg_isready——它會真的做一次
+          # 協定層的握手，比 nc -z 有意義。initdb 期間 5432 就已經在聽了，
+          # 但那時還不能用，nc 會誤判成就緒。
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+
+        - name: wait-for-minio
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              # 有上限的重試（無限迴圈會讓 pod 永遠卡在 PodInitializing）
+              URL=http://minio.streaming.svc.cluster.local:9000/minio/health/ready
+              echo "等待 MinIO（最多 60 次 × 2 秒）..."
+              for i in $(seq 1 60); do
+                if curl -sf "$URL" >/dev/null 2>&1; then
+                  echo "MinIO 已就緒（第 ${i} 次）"; exit 0
+                fi
+                [ $((i % 10)) -eq 0 ] && echo "  第 ${i} 次仍未就緒"
+                sleep 2
+              done
+              echo "❌ 等待逾時：$URL 連不上"; exit 1
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+
+      containers:
+        - name: iceberg-rest
+          # 釘住版本而不用 latest——compose 用 latest，那會在你沒預期時變動。
+          image: tabulario/iceberg-rest:1.6.0
+
+          ports:
+            - name: http
+              containerPort: 8181
+
+
+          env:
+            # --- ★ Catalog 的後端（2026-08-26 從 SQLite 換成 Postgres）--
+            #
+            # 不設 CATALOG_URI 就會退回 image 預設的 in-memory SQLite，
+            # pod 一重啟「有哪些表」全部歸零（8/25 踩過）。
+            #
+            # 8/25 的第一版是 jdbc:sqlite:file:/data/catalog.db（PVC 上的檔案），
+            # 解決了持久化，但 8/26 演練時炸出**並行寫入**的問題：
+            #   [SQLITE_BUSY] The database file is locked
+            # 兩個 Flink job 同時 commit → SQLite 單寫者模型直接拒絕 →
+            # HTTP 500 → CommitStateUnknownException → 無法自癒的重啟迴圈。
+            # 完整記錄見 doc/updated_plan/week9-decisions.md。
+            - name: CATALOG_CATALOG__IMPL
+              value: "org.apache.iceberg.jdbc.JdbcCatalog"
+            - name: CATALOG_URI
+              value: "jdbc:postgresql://catalog-db:5432/iceberg"
+            - name: CATALOG_JDBC_USER
+              value: "iceberg"
+            - name: CATALOG_JDBC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: streaming-secrets
+                  key: CATALOG_DB_PASSWORD
+            # ⚠️ CATALOG_JDBC_* 會變成 Iceberg 的 jdbc.user / jdbc.password。
+            #    可以在啟動日誌的第一行確認實際生效的設定：
+            #      Creating catalog with properties: {jdbc.user=iceberg, ...}
+            #    看到 jdbc.user=user（image 的預設值）就代表沒吃到。
+
+            # --- S3 憑證（其實是 MinIO 的帳密）------------------------
+            # Iceberg 用 AWS SDK 存取物件儲存，所以變數名是 AWS_*，
+            # 但指向的是我們自架的 MinIO。
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: streaming-secrets
+                  key: MINIO_ROOT_USER
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: streaming-secrets
+                  key: MINIO_ROOT_PASSWORD
+            # MinIO 不分區域，但 AWS SDK 一定要有值，隨便給一個合法的
+            - name: AWS_REGION
+              value: "us-east-1"
+
+            # --- Catalog 設定 -----------------------------------------
+            # 注意變數名裡的雙底線：CATALOG_IO__IMPL 會被轉成
+            # catalog 設定的 io-impl（__ → -）。這是 tabulario image 的慣例。
+            - name: CATALOG_WAREHOUSE
+              value: "s3://warehouse/"
+            - name: CATALOG_IO__IMPL
+              value: "org.apache.iceberg.aws.s3.S3FileIO"
+            - name: CATALOG_S3_ENDPOINT
+              value: "http://minio.streaming.svc.cluster.local:9000"
+            # path-style：用 endpoint/bucket/key 而不是 bucket.endpoint/key。
+            # MinIO 只支援前者，AWS S3 兩者都行——不設會連不上。
+            - name: CATALOG_S3_PATH__STYLE__ACCESS
+              value: "true"
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              cpu: 500m
+              memory: 768Mi
+
+          # /v1/config 是 Iceberg REST 規格定義的端點，回傳 catalog 設定。
+          # 它會實際接觸 S3，所以拿來當 readiness 很合適。
+          startupProbe:
+            httpGet: { path: /v1/config, port: http }
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet: { path: /v1/config, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /v1/config, port: http }
+            periodSeconds: 30
+            failureThreshold: 3
+
+      # 沒有 volumes——這個 pod 現在真的無狀態了。
+      #
+      # 兩天之內這份 manifest 對「它有沒有狀態」的判斷改了三次：
+      #   8/24  無狀態（錯：以為 catalog 中繼資料都在 MinIO）
+      #   8/25  有狀態，加 PVC + SQLite（對，但選錯了後端）
+      #   8/26  無狀態，狀態外推到 catalog-db（對）
+      #
+      # 這不是反覆，是每次拿到新證據就修正。值得留著當紀錄：
+      # 「這個服務有沒有狀態」比想像中難判斷，
+      # 而判斷錯的代價是隔天才會顯現。
+      #
+      # ⚠️ 遺留物：8/25 建的 PVC `iceberg-rest-catalog` 不會被 apply 自動刪除
+      #    （移除 manifest 裡的定義 ≠ 刪除叢集裡的物件）。
+      #    確認新版跑起來之後手動清掉，否則那顆 10Gi 磁碟會一直算錢：
+      #      kubectl delete pvc iceberg-rest-catalog -n streaming

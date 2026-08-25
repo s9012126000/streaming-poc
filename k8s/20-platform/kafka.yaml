@@ -1,0 +1,260 @@
+# ---------------------------------------------------------------------------
+# Kafka 3-broker（KRaft）—— Week 7 最難的一段。
+#
+# 命名刻意分開，讓位址一眼看得懂來源：
+#   StatefulSet name = broker   →  pod 叫 broker-0 / broker-1 / broker-2
+#   headless Service = kafka    →  DNS  broker-0.kafka.streaming.svc.cluster.local
+#
+# 對照 docker-compose：三個各自定義的 broker-1/2/3 收斂成一個 StatefulSet，
+# 差異部分（node id、advertised listener）由 pod 序號在啟動時算出來。
+# ---------------------------------------------------------------------------
+
+# --- Headless Service：broker 之間互相定址的基礎 ---------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: streaming
+  labels:
+    app: kafka
+spec:
+  clusterIP: None
+  # ⚠️ 這一行很重要：pod 還沒 Ready 時也要有 DNS 記錄。
+  #    因為 broker 啟動時要先互相連上組成 quorum，才可能變 Ready——
+  #    如果 DNS 要等 Ready 才出現，就會死結：
+  #      A 等 B 的 DNS → B 等 A 的 DNS → 兩個都起不來
+  publishNotReadyAddresses: true
+  selector:
+    app: kafka
+  ports:
+    - name: client
+      port: 9092
+      targetPort: client
+    - name: controller
+      port: 9093
+      targetPort: controller
+---
+# --- 一般 Service：給 client 用的 bootstrap 入口 ---------------------------
+# Producer / Flink / Trino 連這個當 bootstrap.servers。
+# client 連上任一 broker 後會拿到完整的 broker 清單和分區 leader 資訊，
+# 之後就直接連特定 broker——那時候走的是上面 headless 的 DNS。
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-bootstrap
+  namespace: streaming
+  labels:
+    app: kafka
+spec:
+  type: ClusterIP
+  selector:
+    app: kafka
+  ports:
+    - name: client
+      port: 9092
+      targetPort: client
+---
+# --- PodDisruptionBudget：Spot 回收時的保護 --------------------------------
+# GKE 排空 node 時會遵守 PDB。minAvailable: 2 表示任何時候至少要有 2 個
+# broker 活著——正好是 min.insync.replicas=2 的要求。
+# 沒有它的話，Spot 可能一次帶走兩台，quorum 直接消失。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka-pdb
+  namespace: streaming
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: kafka
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: broker
+  namespace: streaming
+  labels:
+    app: kafka
+spec:
+  serviceName: kafka          # ← 指向上面的 headless Service
+  replicas: 3
+  podManagementPolicy: Parallel
+  # 預設是 OrderedReady：broker-0 完全 Ready 才啟動 broker-1。
+  # 但 KRaft 的 quorum 需要多數節點「同時」在線才選得出 controller，
+  # 依序啟動會讓 broker-0 永遠等不到同伴而卡住。Parallel 是必要的。
+
+  selector:
+    matchLabels:
+      app: kafka
+
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      terminationGracePeriodSeconds: 60   # 給 Kafka 時間把 log flush 完
+
+      # --- 磁碟權限（沒有這段 Kafka 起不來）-------------------------
+      # PVC 掛進來時是 root:root 擁有，但 cp-kafka 用 appuser(uid 1000) 執行，
+      # 結果 preflight 檢查就掛在 "Check if /var/lib/kafka/data is writable"。
+      #
+      # fsGroup 讓 kubelet 在掛載時把 volume 的群組改成 1000 並加上群組寫入權限。
+      # MinIO 沒踩到是因為它預設用 root 跑——同一顆 PVC、不同的 image 慣例，
+      # 這種差異在 Compose 時代不會遇到（docker 預設就是 root）。
+      #
+      # fsGroupChangePolicy: OnRootMismatch —— 只在根目錄擁有者不對時才遞迴 chown。
+      # 沒有這行的話，每次 pod 重啟都要把整顆磁碟走一遍，資料多了會很慢。
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+
+      # --- 硬性分散 + 最少域數 ---------------------------------------
+      #
+      # maxSkew: 1 + DoNotSchedule 是 Week 6 的教訓（暖身用軟性約束，
+      # 實測兩次都擠在同一台）。但實測發現這樣還不夠——
+      #
+      # ⚠️ topologySpread 只計算「**存在的**拓撲域」：
+      #     Spot 換機的某個瞬間叢集只剩 1 台 node
+      #       → 只有 1 個域 → skew = max(3) - min(3) = 0
+      #       → 完全滿足 maxSkew: 1
+      #       → 三個 broker 全排上去，quorum 形同虛設
+      #
+      # 這實際發生過（三個 broker 同時落在 d7lf 上）。
+      #
+      # minDomains: 2 補上這個缺口——強制「至少要有 2 個拓撲域」，
+      # 只剩一台 node 時 broker 會全部 Pending 而不是全擠上去。
+      #
+      # 取捨：單節點期間服務完全停擺，而不是「跑起來但隨時全滅」。
+      # 這延續 Week 6 選 DoNotSchedule 的同一個判斷：
+      # 明確停擺比假性健康誠實。
+      #
+      # （minDomains 需要 whenUnsatisfiable: DoNotSchedule，K8s 1.30+ GA）
+      topologySpreadConstraints:
+        - maxSkew: 1
+          minDomains: 2
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: kafka
+
+      containers:
+        - name: kafka
+          image: confluentinc/cp-kafka:7.9.0
+
+          ports:
+            - name: client
+              containerPort: 9092
+            - name: controller
+              containerPort: 9093
+
+          # --- 共用設定從 ConfigMap 來 -----------------------------
+          envFrom:
+            - configMapRef:
+                name: kafka-config
+
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+          # --- 每個 broker 不同的部分，在這裡算出來 -----------------
+          #
+          # ★ 這是整個 Week 7 最關鍵的十行 ★
+          #
+          # KAFKA_NODE_ID：從 pod 名字尾巴取序號。
+          #   broker-0 → 0，broker-1 → 1，broker-2 → 2
+          #   StatefulSet 保證這個序號穩定，重建也不會變——
+          #   這正是 Deployment 做不到、非用 StatefulSet 不可的理由。
+          #
+          # KAFKA_ADVERTISED_LISTENERS：告訴 client「請用這個位址找我」。
+          #   必須是該 pod 專屬的、解析得到的固定名稱。
+          #   三個都寫錯會有三種不同的壞法：
+          #     寫 0.0.0.0        → client 拿到 0.0.0.0，連不到
+          #     寫 pod IP         → 重建後 IP 變了，client 連到舊位址
+          #     寫 kafka:9092     → ClusterIP 會隨機轉送，
+          #                        client 想找 broker-1 卻連到 broker-2，協定壞掉
+          #   正確答案只有一個：broker-N.kafka.streaming.svc.cluster.local
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              FQDN="${POD_NAME}.kafka.streaming.svc.cluster.local"
+
+              export KAFKA_NODE_ID="${POD_NAME##*-}"
+
+              # --- client listener：綁全部介面，對外報 FQDN ---------------
+              export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${FQDN}:9092"
+
+              # --- controller listener：★ 必須綁 FQDN，不能綁 0.0.0.0 ★ ---
+              # 這是實測踩出來的坑：
+              #   1. Kafka 禁止把 CONTROLLER 寫進 advertised.listeners
+              #   2. 但沒被 advertise 的 listener，Kafka 會回頭拿 listeners 的值
+              #      當作對外位址
+              #   3. 於是 CONTROLLER://0.0.0.0:9093 讓它自己的驗證擋下來：
+              #      "advertised.listeners cannot use the nonroutable meta-address 0.0.0.0"
+              # 解法只有一個：讓 listeners 本身就是可路由的位址。
+              # 綁 FQDN 沒有副作用——它解析到這個 pod 自己的 IP。
+              export KAFKA_LISTENERS="PLAINTEXT://0.0.0.0:9092,CONTROLLER://${FQDN}:9093"
+
+              echo "=== node id   : ${KAFKA_NODE_ID}"
+              echo "=== listeners : ${KAFKA_LISTENERS}"
+              echo "=== advertised: ${KAFKA_ADVERTISED_LISTENERS}"
+
+              exec /etc/confluent/docker/run
+
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+              # subPath 讓 Kafka 拿到磁碟裡的一個子目錄，而不是根目錄。
+              # 原因：ext4 格式化後根目錄一定有 lost+found，
+              # 而 Kafka 會把 log.dirs 底下的每個目錄當成分區資料夾去解析，
+              # 看到 lost+found 可能誤判。用子目錄就完全避開這個問題。
+              subPath: kafka
+
+          resources:
+            requests:
+              cpu: 300m
+              memory: 1536Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+
+          # --- Probe -------------------------------------------------
+          # 用 tcpSocket 而不是 kafka-broker-api-versions：
+          # 後者每次檢查都要啟動一個 JVM，在只有 7.84 vCPU 的叢集上
+          # 每 10 秒燒一次太浪費。tcpSocket 只確認 listener 綁起來了，
+          # 訊號稍弱但成本幾乎為零——這是刻意的取捨。
+          startupProbe:
+            tcpSocket:
+              port: client
+            periodSeconds: 10
+            failureThreshold: 30      # 最多等 5 分鐘（KRaft 首次選舉可能較慢）
+          readinessProbe:
+            tcpSocket:
+              port: client
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: client
+            periodSeconds: 20
+            failureThreshold: 3
+
+  # --- 每個 broker 一顆自己的磁碟 -------------------------------------
+  # data-broker-0 / data-broker-1 / data-broker-2
+  # 3 × 20Gi = 60Gi，走 pd-standard（DISKS_TOTAL_GB=2048），不碰 SSD 配額。
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 20Gi

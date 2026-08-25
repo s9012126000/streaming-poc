@@ -1,0 +1,103 @@
+# ---------------------------------------------------------------------------
+# kafka-init — 建立 topic。
+#
+# 對應 docker-compose.yml 的 kafka-init 一次性容器，但拆掉了 schema 註冊：
+# 那一段依賴 Schema Registry，而 Schema Registry 還沒部署（Week 7-4），
+# 所以移到那時候再做。一個 Job 只做一件事，失敗時也好判斷是哪一段。
+#
+# 冪等性（驗收項目）：
+#   kafka-topics --create --if-not-exists  → topic 已存在時靜默通過
+#   整支腳本重跑不會報錯、不會重複建立、不會改動既有 topic
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-init
+  namespace: streaming
+  labels:
+    app: kafka-init
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+
+  template:
+    metadata:
+      labels:
+        app: kafka-init
+    spec:
+      restartPolicy: OnFailure
+
+      # --- 等三個 broker 都能用 -------------------------------------
+      # 對應 compose 的 depends_on: condition: service_healthy（×3）。
+      # 注意這裡等的不只是「連得上」，而是「metadata 查得到三個 broker」——
+      # 只有一個 broker 起來時 RF=3 的 topic 是建不成功的。
+      initContainers:
+        - name: wait-for-kafka
+          image: confluentinc/cp-kafka:7.9.0
+          command:
+            - sh
+            - -c
+            - |
+              echo "等待 3 個 broker 全部就緒 ..."
+              for i in $(seq 1 60); do
+                COUNT=$(kafka-broker-api-versions \
+                          --bootstrap-server kafka-bootstrap:9092 2>/dev/null \
+                        | grep -c 'id: ' || true)
+                echo "  第 ${i} 次：看到 ${COUNT} 個 broker"
+                [ "${COUNT}" -ge 3 ] && echo "三個 broker 都在，繼續" && exit 0
+                sleep 5
+              done
+              echo "❌ 等了 5 分鐘仍不足 3 個 broker"
+              exit 1
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+
+      containers:
+        - name: kafka-topics
+          image: confluentinc/cp-kafka:7.9.0
+          env:
+            - name: BOOTSTRAP
+              value: "kafka-bootstrap:9092"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+
+              # 建立一個 topic。--if-not-exists 是冪等的關鍵。
+              create() {
+                echo "--> ${1}  (partitions=${2}, RF=3)"
+                kafka-topics --bootstrap-server "$BOOTSTRAP" \
+                  --create --if-not-exists \
+                  --topic "$1" --partitions "$2" --replication-factor 3
+              }
+
+              echo "=== 建立 topic ==="
+              create market-trades        16
+              create market-trades-clean  16
+              create market-quotes        16
+              create market-alerts         4
+              create market-price-alerts   4
+              create market-dlq            4
+
+              echo
+              echo "=== 現有 topic ==="
+              kafka-topics --bootstrap-server "$BOOTSTRAP" --list
+
+              echo
+              echo "=== 驗證 RF=3 與 ISR ==="
+              # ReplicationFactor 必須是 3，Isr 必須有三個 broker id。
+              # 只印 market-trades 當代表，其他同理。
+              kafka-topics --bootstrap-server "$BOOTSTRAP" \
+                --describe --topic market-trades | head -5
+
+              echo
+              echo "=== 檢查有沒有副本數不足的分區（正常應該沒有輸出）==="
+              kafka-topics --bootstrap-server "$BOOTSTRAP" \
+                --describe --under-replicated-partitions
+
+              echo "kafka-init 完成。"
+          resources:
+            requests: { cpu: 100m, memory: 384Mi }
+            limits:   { cpu: 500m, memory: 768Mi }

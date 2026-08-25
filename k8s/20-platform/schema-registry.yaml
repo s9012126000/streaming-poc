@@ -1,0 +1,142 @@
+# ---------------------------------------------------------------------------
+# Schema Registry — 無狀態 Deployment。
+#
+# 為什麼不是 StatefulSet：
+#   它自己不存任何東西。所有 schema 存在 Kafka 的一個內部 topic
+#   （_schemas，自動建立，RF 沿用 broker 設定）。
+#   pod 掛掉重建後，從那個 topic 重讀就恢復了——所以副本可互換 → Deployment。
+#
+# 依賴方向：Schema Registry 依賴 Kafka，Kafka 不依賴它。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: schema-registry
+  namespace: streaming
+  labels:
+    app: schema-registry
+spec:
+  type: ClusterIP
+  selector:
+    app: schema-registry
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: schema-registry
+  namespace: streaming
+  labels:
+    app: schema-registry
+spec:
+  replicas: 1
+  # 單副本的理由：Schema Registry 有 leader 選舉機制，多副本要額外設定
+  # （SCHEMA_REGISTRY_LEADER_ELIGIBILITY 等），而這個 PoC 的 schema
+  # 幾乎不變動，單副本的可用性已足夠。掛掉重建約 30 秒。
+  selector:
+    matchLabels:
+      app: schema-registry
+
+  template:
+    metadata:
+      labels:
+        app: schema-registry
+    spec:
+      # --- ★ 必須關掉，否則容器會啟動失敗 ★ ------------------------
+      # K8s 有個 Docker link 時代留下的相容機制：會為 namespace 內每個
+      # Service 自動注入環境變數，格式是 <SERVICE_NAME>_PORT 等等。
+      #
+      # 我們的 Service 叫 schema-registry → 注入 SCHEMA_REGISTRY_PORT
+      #                                     （值是 tcp://10.x.x.x:8081）
+      #
+      # 而 Confluent 的 configure 腳本有這段：
+      #     if [[ -n "${SCHEMA_REGISTRY_PORT-}" ]]; then
+      #       echo "PORT is deprecated. Please use SCHEMA_REGISTRY_LISTENERS instead."
+      #       exit 1
+      #     fi
+      #
+      # 於是「Service 的名字」意外撞上「應用程式的設定變數名」，
+      # 容器每次啟動都在這裡 exit 1——而那行訊息看起來只像個警告。
+      #
+      # enableServiceLinks: false 關掉整套自動注入。
+      # 不影響 DNS（服務發現照常走 schema-registry.streaming.svc.cluster.local）。
+      enableServiceLinks: false
+
+      # --- 等 Kafka 可用 -------------------------------------------
+      # 對應 compose 的 depends_on × 3。
+      # 這裡只要求「連得上」而非「三個都在」——Schema Registry 自己會重試，
+      # 而且它建 _schemas topic 時只需要 metadata 可讀。
+      initContainers:
+        - name: wait-for-kafka
+          image: confluentinc/cp-kafka:7.9.0
+          command:
+            - sh
+            - -c
+            - |
+              echo "等待 Kafka ..."
+              for i in $(seq 1 60); do
+                if kafka-broker-api-versions \
+                     --bootstrap-server kafka-bootstrap:9092 >/dev/null 2>&1; then
+                  echo "Kafka 可用"; exit 0
+                fi
+                echo "  第 ${i} 次重試"; sleep 5
+              done
+              echo "❌ 等待 Kafka 逾時"; exit 1
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+
+      containers:
+        - name: schema-registry
+          image: confluentinc/cp-schema-registry:7.9.0
+
+          ports:
+            - name: http
+              containerPort: 8081
+
+          env:
+            # HOST_NAME 是 Schema Registry 用來向其他副本自我介紹的位址。
+            # 單副本其實用不到，但不設會啟動失敗，所以用 pod 名。
+            - name: SCHEMA_REGISTRY_HOST_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS
+              value: "kafka-bootstrap:9092"
+            - name: SCHEMA_REGISTRY_LISTENERS
+              value: "http://0.0.0.0:8081"
+            # _schemas topic 的副本數。預設是 3，正好符合我們的 broker 數；
+            # 寫明是為了避免之後 broker 數變動時出現意外。
+            - name: SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR
+              value: "3"
+            - name: SCHEMA_REGISTRY_HEAP_OPTS
+              value: "-Xms256m -Xmx512m"
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 640Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+
+          # /subjects 是 compose healthcheck 用的端點，沿用。
+          # 它會實際去讀 _schemas topic，比單純的 TCP 檢查有意義。
+          startupProbe:
+            httpGet: { path: /subjects, port: http }
+            periodSeconds: 5
+            failureThreshold: 24        # 最多等 2 分鐘
+          readinessProbe:
+            httpGet: { path: /subjects, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            # liveness 用 / 而不是 /subjects——後者要讀 Kafka，
+            # Kafka 一慢就會導致整批 Schema Registry 重啟（雪崩）。
+            # liveness 只該問「這個 process 自己還活著嗎」。
+            httpGet: { path: /, port: http }
+            periodSeconds: 20
+            failureThreshold: 3

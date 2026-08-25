@@ -26,7 +26,9 @@ SELECT to_unixtime(date_trunc('minute', event_ts)) AS bucket_ts,
        max(price)                                  AS high,
        min(price)                                  AS low,
        max_by(price, trade_time)                   AS close,
-       sum(size)                                   AS volume
+       sum(size)                                   AS volume,
+       -- 與 Flink 的 vwap_1min job 同一條式子，兩邊算出來的分鐘 VWAP 才會一致
+       sum(price * size) / nullif(sum(size), 0)    AS vwap
 FROM iceberg.bronze.trades
 WHERE symbol = ? AND trade_date >= ?
 GROUP BY 1
@@ -99,8 +101,11 @@ def fetch_klines(symbol: str, limit: int = 240) -> list[dict]:
         conn.close()
 
     # Lightweight Charts 的 time 是 UTC epoch 秒
+    # vwap 只在整分鐘成交量為 0 時才會是 NULL（nullif 擋除以零）——那種分鐘
+    # 沒有價格資訊可言，退回收盤價，前端才不會因為一個 null 斷掉整條線。
     return [{"time": int(r[0]), "open": float(r[1]), "high": float(r[2]),
-             "low": float(r[3]), "close": float(r[4]), "volume": float(r[5])}
+             "low": float(r[3]), "close": float(r[4]), "volume": float(r[5]),
+             "vwap": float(r[6]) if r[6] is not None else float(r[4])}
             for r in reversed(rows)]
 
 
@@ -114,4 +119,6 @@ if __name__ == "__main__":
     ks = fetch_klines(os.environ.get("CHART_SYMBOL", "BTCUSDT"), limit=10)
     assert all(k["low"] <= k["open"] <= k["high"] and k["low"] <= k["close"] <= k["high"] for k in ks)
     assert [k["time"] for k in ks] == sorted(k["time"] for k in ks)
+    # 成交量加權平均價一定落在當分鐘的高低點之間，落在外面就是 SQL 寫錯了
+    assert all(k["low"] <= k["vwap"] <= k["high"] for k in ks)
     logger.info(f"✅ fetched {len(ks)} candles: {ks[-1] if ks else 'empty'}")

@@ -1,0 +1,159 @@
+# ---------------------------------------------------------------------------
+# Flink TaskManager —— 實際執行運算的地方。
+#
+# 為什麼可以是 Deployment（無狀態）：
+#   所有狀態都在 checkpoint 裡，而 checkpoint 寫在 MinIO。
+#   TaskManager 被 Spot 回收 → 新 pod 起來 → 向 JobManager 註冊
+#   → JobManager 把任務重新分派 → 從最近的 checkpoint 恢復。
+#
+#   這就是「Week 2 的 checkpoint 恢復驗證」在 K8s 上的對應：
+#   kubectl delete pod 一個 TaskManager，job 應自動恢復且無重複資料。
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-taskmanager
+  namespace: streaming
+  labels:
+    app: flink
+    component: taskmanager
+spec:
+  replicas: 2
+  # 2 個 TaskManager × 2 slots = 4 個平行度。
+  # compose 也是 2 個副本，維持一致，Week 2-3 的 job 平行度設定不用改。
+
+  selector:
+    matchLabels:
+      app: flink
+      component: taskmanager
+
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: taskmanager
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9249"
+    spec:
+      enableServiceLinks: false     # 同 JobManager，FLINK_* 撞名風險
+
+      # 開了 HA 之後，TaskManager 找 JobManager 的方式改變了——
+      # 不再是「連到 jobmanager.rpc.address 這個固定位址」，
+      # 而是「去 HA 服務問現在的 leader 是誰」。所以 TM 也要有權限。
+      # 只給 JM 而漏掉 TM 的話，TM 會起來但註冊不上，
+      # slots-total 永遠是 0，submit Job 卡在 wait-slots 逾時。
+      serviceAccountName: flink
+
+      terminationGracePeriodSeconds: 30
+
+      # 兩個 TaskManager 盡量分散——一台 node 掛掉不要兩個一起沒。
+      # 用軟性（ScheduleAnyway）而不是像 Kafka 那樣硬性：
+      # TaskManager 是無狀態的，擠在一台只影響容錯速度，
+      # 不會造成 Kafka 那種「quorum 消失」的結構性問題。
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: flink
+              component: taskmanager
+
+      # --- 等 JobManager 起來 ---------------------------------------
+      # TaskManager 啟動時會立刻嘗試註冊，JobManager 還沒好的話會重試，
+      # 但日誌會噴一堆連線錯誤很難讀。先等一下比較乾淨。
+      initContainers:
+        - name: wait-jobmanager
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              echo "等待 JobManager（最多 60 次 × 2 秒）..."
+              for i in $(seq 1 60); do
+                if curl -sf http://flink-jobmanager:8081/ >/dev/null 2>&1; then
+                  echo "JobManager 已就緒（第 ${i} 次）"; exit 0
+                fi
+                [ $((i % 10)) -eq 0 ] && echo "  第 ${i} 次仍未就緒"
+                sleep 2
+              done
+              echo "❌ 等待逾時"; exit 1
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+
+      containers:
+        - name: taskmanager
+          image: asia-east1-docker.pkg.dev/project-ea92bc23-509c-459a-a30/streaming-poc/flink:latest
+          imagePullPolicy: Always
+          args: ["taskmanager"]
+
+          ports:
+            - name: metrics
+              containerPort: 9249
+            # TaskManager 的 RPC / data port 由 Flink 動態配置，
+            # pod 之間直接用 IP 通訊，不需要 Service，也不用宣告。
+
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef: { name: streaming-secrets, key: MINIO_ROOT_USER }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: streaming-secrets, key: MINIO_ROOT_PASSWORD }
+
+            # TaskManager 要用 pod IP 向 JobManager 註冊。
+            # 不設的話 Flink 會嘗試用 hostname 解析，而 Deployment 的 pod
+            # 沒有穩定 DNS——這是 Flink on K8s 常見的註冊失敗原因。
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+
+            - name: FLINK_PROPERTIES
+              value: |
+                jobmanager.rpc.address: flink-jobmanager
+                taskmanager.memory.process.size: 2048m
+                taskmanager.numberOfTaskSlots: 2
+                high-availability.type: kubernetes
+                high-availability.storageDir: s3://warehouse/flink-ha
+                kubernetes.cluster-id: streaming-poc-flink
+                kubernetes.namespace: streaming
+                state.backend: rocksdb
+                state.backend.rocksdb.memory.managed: true
+                state.checkpoints.dir: s3://warehouse/checkpoints
+                state.savepoints.dir: s3://warehouse/savepoints
+                s3.endpoint: http://minio.streaming.svc.cluster.local:9000
+                s3.path.style.access: true
+                metrics.reporter.prometheus.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+                metrics.reporter.prometheus.port: 9249
+
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2560Mi
+            limits:
+              cpu: "1500m"
+              memory: 3Gi
+          # process.size 2048m vs limits 3Gi —— 留約 1Gi 給
+          # RocksDB 堆外記憶體與 JVM 額外開銷。
+          # 這個比例是 Flink 官方建議的方向：容器記憶體要比
+          # process.size 大 20-50%。
+
+          # TaskManager 沒有 HTTP 端點（只有 metrics），
+          # 所以用 tcpSocket 檢查 metrics 埠。
+          # 訊號比 HTTP 弱，但 TaskManager 的健康其實由 JobManager
+          # 透過心跳判定——K8s 的 probe 只是輔助。
+          startupProbe:
+            tcpSocket: { port: metrics }
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            tcpSocket: { port: metrics }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket: { port: metrics }
+            periodSeconds: 30
+            failureThreshold: 3

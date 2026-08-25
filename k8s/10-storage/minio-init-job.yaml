@@ -1,0 +1,90 @@
+# ---------------------------------------------------------------------------
+# minio-init — 建立 warehouse bucket。
+#
+# 對應 docker-compose.yml 的 minio-init 一次性容器。
+#
+# Compose 用 depends_on: condition: service_healthy 等 MinIO 起來；
+# K8s 沒有這種東西，所以改用 initContainer 自己輪詢。
+# 這是 Compose → K8s 最常見的一個轉換模式。
+#
+# 冪等性：mc mb --ignore-existing，重跑不會報錯。
+# 驗收清單有一條「Job 重跑一次不報錯、不重複建立」，靠的就是這個。
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: streaming
+  labels:
+    app: minio-init
+spec:
+  backoffLimit: 6          # 失敗最多重試 6 次（含指數退避），之後標記失敗
+  ttlSecondsAfterFinished: 3600   # 完成 1 小時後自動清除 Job 物件，
+                                  # 免得 namespace 裡堆一堆已完成的 Job
+
+  template:
+    metadata:
+      labels:
+        app: minio-init
+    spec:
+      restartPolicy: OnFailure
+
+      # --- initContainer：等 MinIO 真的能連上 ---------------------------
+      # 這就是 Compose `depends_on: service_healthy` 的 K8s 對應寫法。
+      # 為什麼不直接在主容器裡 retry：職責分離——
+      # 「等待依賴」和「做事」分開，日誌也比較好讀。
+      initContainers:
+        - name: wait-for-minio
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              # 有上限的重試（無限迴圈會讓 pod 永遠卡在 PodInitializing）
+              URL=http://minio.streaming.svc.cluster.local:9000/minio/health/ready
+              echo "等待 MinIO（最多 60 次 × 2 秒）..."
+              for i in $(seq 1 60); do
+                if curl -sf "$URL" >/dev/null 2>&1; then
+                  echo "MinIO 已就緒（第 ${i} 次）"; exit 0
+                fi
+                [ $((i % 10)) -eq 0 ] && echo "  第 ${i} 次仍未就緒"
+                sleep 2
+              done
+              echo "❌ 等待逾時：$URL 連不上"; exit 1
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: streaming-secrets
+                  key: MINIO_ROOT_USER
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: streaming-secrets
+                  key: MINIO_ROOT_PASSWORD
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              mc alias set local \
+                http://minio.streaming.svc.cluster.local:9000 \
+                "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+
+              # --ignore-existing 是冪等的關鍵：bucket 已存在時靜默通過
+              mc mb --ignore-existing local/warehouse
+              mc mb --ignore-existing local/warehouse/checkpoints
+
+              echo "--- 現有 bucket ---"
+              mc ls local
+              echo "MinIO buckets ready."
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 128Mi }

@@ -21,9 +21,15 @@ MARKET_OPEN = time(9, 30, 0)
 MARKET_CLOSE = time(16, 0, 0)
 
 
-def is_market_open() -> bool:
-    """判斷美股目前是否在交易時段"""
-    now_et = datetime.now(US_EASTERN)
+def is_market_open(now: datetime | None = None) -> bool:
+    """判斷美股目前是否在交易時段。
+
+    以美東時間判斷，夏令時等同 UTC+8 週一至週五 21:30 到隔天 04:00；
+    冬令時整段自動往後移一小時（22:30–05:00），假日也一併排除。
+    不要改成寫死 UTC+8 的時段：UTC+8 的週六 00:00–04:00 其實是美東週五盤中，
+    用 UTC+8 的星期幾去判斷會把週五尾盤整段砍掉。
+    """
+    now_et = now.astimezone(US_EASTERN) if now else datetime.now(US_EASTERN)
 
     # 週末
     if now_et.weekday() >= 5:
@@ -38,13 +44,21 @@ def is_market_open() -> bool:
     return MARKET_OPEN <= current_time < MARKET_CLOSE
 
 
-def seconds_until_market_open() -> int:
-    """計算距離下一個開盤還有幾秒"""
-    now_et = datetime.now(US_EASTERN)
-    # 簡化計算，實際可加入假日邏輯
-    next_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    if now_et >= next_open:
-        from datetime import timedelta
-        next_open += timedelta(days=1)
-    delta = next_open - now_et
-    return int(delta.total_seconds())
+if __name__ == "__main__":
+    TAIPEI = pytz.timezone("Asia/Taipei")
+
+    def tpe(y, m, d, hh, mm):
+        return TAIPEI.localize(datetime(y, m, d, hh, mm))
+
+    # 夏令時：台北時間 週一 21:30 開盤、週六 04:00 收盤（= 美東週五 16:00）
+    assert not is_market_open(tpe(2026, 8, 3, 21, 29))   # 週一 開盤前一分鐘
+    assert is_market_open(tpe(2026, 8, 3, 21, 30))       # 週一 開盤
+    assert is_market_open(tpe(2026, 8, 8, 3, 59))        # 週六凌晨 = 美東週五盤中
+    assert not is_market_open(tpe(2026, 8, 8, 4, 0))     # 週六凌晨 = 美東週五收盤
+    assert not is_market_open(tpe(2026, 8, 9, 2, 0))     # 週日凌晨，美股週末
+    # 冬令時整段往後一小時
+    assert not is_market_open(tpe(2026, 12, 1, 21, 30))
+    assert is_market_open(tpe(2026, 12, 1, 22, 30))
+    # 假日（Christmas，美東週五）
+    assert not is_market_open(tpe(2026, 12, 25, 23, 0))
+    print("market_hours OK")

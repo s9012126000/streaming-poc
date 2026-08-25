@@ -1,0 +1,215 @@
+# ---------------------------------------------------------------------------
+# Trino — 按需啟動，平常 replicas: 0。
+#
+# Week 6 定案：不常駐，省 1 vCPU / 3 Gi。
+# 理由是查詢本來就是互動式的，沒有人在查的時候讓它佔著資源沒有意義。
+#
+# 為什麼是「Deployment 縮到 0」而不是「每次建一個 Job」：
+#   Service 必須一直存在——Gateway 的設定寫死 TRINO_HOST: trino，
+#   如果 Service 隨 Job 生滅，Gateway 每次都要重新解析、還會在
+#   Trino 不在時噴 DNS 錯誤。
+#   Deployment 縮到 0 的話 Service 還在，只是 endpoints 是空的，
+#   Gateway 拿到的是「連線被拒」——那是可以優雅處理的錯誤。
+#
+# 用 k8s/deploy/gcp/15-trino.sh 控制起停。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-config
+  namespace: streaming
+  labels:
+    app: trino
+data:
+  # --- Iceberg catalog -------------------------------------------------
+  # iceberg-rest:8181 和 minio:9000 都是短名，同 namespace 解析得到，
+  # 不用改。${ENV:...} 是 Trino 的語法，從環境變數取值。
+  #
+  # ⚠️ 屬性名是 fs.native-s3.enabled，不是 fs.s3.enabled。
+  #    compose 用的是 trinodb/trino:latest，這裡釘成 476，中間屬性名改過：
+  #      ~476  → fs.native-s3.enabled
+  #      483+  → fs.s3.enabled（簡化後的寫法）
+  #
+  #    寫錯的症狀特別誤導：Trino 會列出**六個**「property was not used」，
+  #    包含 s3.endpoint、s3.region 等等——看起來像六個獨立問題。
+  #    實際上是因為 enable 旗標沒生效 → S3 檔案系統模組根本沒載入
+  #    → 它底下所有屬性自然都「沒被使用」。
+  #    真正要修的只有第一行。
+  iceberg.properties: |
+    connector.name=iceberg
+    iceberg.catalog.type=rest
+    iceberg.rest-catalog.uri=http://iceberg-rest:8181
+    iceberg.rest-catalog.warehouse=s3://warehouse/
+    fs.native-s3.enabled=true
+    s3.endpoint=http://minio:9000
+    s3.path-style-access=true
+    s3.region=us-east-1
+    s3.aws-access-key=${ENV:MINIO_ROOT_USER}
+    s3.aws-secret-key=${ENV:MINIO_ROOT_PASSWORD}
+
+  # --- JVM（原樣沿用，理由見 docker/trino/etc/jvm.config 的註解）------
+  # 重點：MaxRAMPercentage=50 而不是官方預設的 80。
+  # RAMPercentage 只管 heap，剩下要塞 code cache、metaspace、
+  # 兩百多條執行緒堆疊、Netty direct buffer。
+  # 80% 配 2Gi limit = 1.6g heap + 0.4g 給其他全部 → 必然 OOM。
+  # 這個專案在 compose 時代已經因此掛過三次。
+  jvm.config: |
+    -server
+    -agentpath:/usr/lib/trino/bin/libjvmkill.so
+    -XX:InitialRAMPercentage=25
+    -XX:MaxRAMPercentage=50
+    -XX:G1HeapRegionSize=32M
+    -XX:+ExplicitGCInvokesConcurrent
+    -XX:+HeapDumpOnOutOfMemoryError
+    -XX:+ExitOnOutOfMemoryError
+    -XX:-OmitStackTraceInFastThrow
+    -XX:ReservedCodeCacheSize=256M
+    -XX:PerMethodRecompilationCutoff=10000
+    -XX:PerBytecodeRecompilationCutoff=10000
+    -Djdk.attach.allowAttachSelf=true
+    -Djdk.nio.maxCachedBufferSize=2000000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trino
+  namespace: streaming
+  labels:
+    app: trino
+spec:
+  type: ClusterIP
+  selector:
+    app: trino
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trino
+  namespace: streaming
+  labels:
+    app: trino
+spec:
+  # ⚠️ 2026-08-23 從 0 改成 1，推翻 Week 6 的「按需啟動」決策。
+  #
+  # 原本的理由：2 台 node 只有 7.84 vCPU，全開需求 8.1，差 0.3——
+  #            砍掉 Trino 常駐正好補上缺口。
+  #
+  # 為什麼推翻：
+  #   1. **Web 前端依賴 Trino**。gateway 的 /api/klines 和 /api/symbols
+  #      都查 Iceberg，Trino 不在的話圖表沒有歷史 K 線、watchlist 是空的。
+  #      「按需啟動」等於「展示前要記得先開」，那不是可以接受的設計。
+  #
+  #   2. **邊際成本是零**。後來為了 Kafka quorum 把 node 加到 3 台，
+  #      可配置量變成 11.76 vCPU，而全開只用約 3.5。
+  #      更重要的是——node 數量是為了 quorum 決定的，不是資源決定的，
+  #      3 台不管跑不跑 Trino 都要開著。
+  #      「省 1 vCPU」只有在能少開一台機器時才省到錢。
+  #
+  # 需要臨時停掉（例如壓力測試時讓出資源）仍可用：
+  #   bash k8s/deploy/gcp/15-trino.sh down
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: trino
+
+  template:
+    metadata:
+      labels:
+        app: trino
+    spec:
+      enableServiceLinks: false
+
+      containers:
+        - name: trino
+          image: trinodb/trino:476
+
+          ports:
+            - name: http
+              containerPort: 8080
+
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef: { name: streaming-secrets, key: MINIO_ROOT_USER }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: streaming-secrets, key: MINIO_ROOT_PASSWORD }
+
+          volumeMounts:
+            # catalog 目錄整包掛進去。Trino 啟動時掃描這個目錄，
+            # 每個 .properties 檔案就是一個 catalog。
+            - name: catalog
+              mountPath: /etc/trino/catalog
+              readOnly: true
+            # jvm.config 用 subPath 只覆蓋單一檔案——
+            # 不用 subPath 的話會把整個 /etc/trino 蓋掉，
+            # config.properties、node.properties 全部消失，Trino 起不來。
+            - name: config
+              mountPath: /etc/trino/jvm.config
+              subPath: jvm.config
+              readOnly: true
+
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "1500m"
+              memory: 3Gi
+          # ⚠️ 從 2Gi 提高到 3Gi——實測 2Gi 會 OOMKilled（exit 137）。
+          #    compose 的 mem_limit: 2g 是給較舊版本的 Trino，
+          #    476 版的基礎記憶體需求較高。
+          #    MaxRAMPercentage=50 → heap 約 1.5g，另外 1.5g 給
+          #    code cache、metaspace、執行緒堆疊、Netty direct buffer。
+
+          # ★ 不能用 httpGet 檢查 /v1/info ★
+          #
+          #   Trino 在「還在初始化」時就會回 HTTP 200，內容是：
+          #       {"starting":true, ...}
+          #   所以 httpGet probe 會太早判定就緒，
+          #   kubectl wait 通過了但查詢會收到
+          #       "Trino server is still initializing"
+          #
+          #   必須檢查 JSON 內容，而 httpGet probe 做不到——
+          #   只好用 exec + curl + grep。
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'curl -sf localhost:8080/v1/info | grep -q ''"starting":false'''
+            periodSeconds: 5
+            failureThreshold: 36        # 最多 3 分鐘
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'curl -sf localhost:8080/v1/info | grep -q ''"starting":false'''
+            periodSeconds: 15
+            failureThreshold: 3
+          livenessProbe:
+            # liveness 只確認 HTTP 服務還活著，不看 starting 狀態——
+            # 否則長時間的 catalog 重新載入會導致誤殺。
+            httpGet: { path: /v1/info, port: http }
+            periodSeconds: 30
+            failureThreshold: 3
+
+      volumes:
+        - name: catalog
+          configMap:
+            name: trino-config
+            items:
+              - key: iceberg.properties
+                path: iceberg.properties
+        - name: config
+          configMap:
+            name: trino-config
+            items:
+              - key: jvm.config
+                path: jvm.config

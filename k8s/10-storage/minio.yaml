@@ -1,0 +1,158 @@
+# ---------------------------------------------------------------------------
+# MinIO — Week 7 的第一個有狀態服務。
+#
+# 為什麼先做 MinIO 而不是 Kafka：
+#   它是最單純的有狀態服務——單一副本、沒有 quorum、沒有 broker 間網路。
+#   用它先驗證「PVC → pd-standard → 掛載 → 資料持久化」這條路，
+#   確定通了再去碰 Kafka 那些複雜的部分。壞掉時只有一個變因。
+#
+# 對照 docker-compose.yml：
+#   volumes: minio_data:/data       → volumeClaimTemplates（PVC）
+#   ports: 9000, 9001               → 兩個 Service
+#   environment: MINIO_ROOT_*       → Secret（envFrom）
+#   healthcheck                     → readiness / liveness probe
+# ---------------------------------------------------------------------------
+
+# --- Headless Service：給 StatefulSet 穩定的 pod DNS ------------------------
+# clusterIP: None 表示不做轉址，DNS 直接回傳 pod IP。
+# StatefulSet 的 serviceName 必須指向這個，pod 才會有
+# minio-0.minio-headless.streaming.svc.cluster.local 這種固定名字。
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-headless
+  namespace: streaming
+  labels:
+    app: minio
+spec:
+  clusterIP: None
+  selector:
+    app: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+---
+# --- 一般 Service：其他服務用這個連 S3 API ---------------------------------
+# iceberg-rest / Flink / Trino 都連 minio.streaming.svc.cluster.local:9000
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: streaming
+  labels:
+    app: minio
+spec:
+  type: ClusterIP
+  selector:
+    app: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+    - name: console
+      port: 9001
+      targetPort: console
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  namespace: streaming
+  labels:
+    app: minio
+spec:
+  serviceName: minio-headless      # ← 必須是上面那個 headless service
+  replicas: 1                      # 單機模式。多副本要用 distributed mode，
+                                   #   那需要 4 個以上節點，這個 PoC 不需要
+  selector:
+    matchLabels:
+      app: minio
+
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      # PVC 綁在特定 zone 的磁碟上，pod 必須回到同一個 zone。
+      # 單 zone 叢集不會有問題，但寫出來讓意圖明確。
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+          # 釘住版本而不用 latest：latest 會在你沒預期的時候變，
+          # PoC 最怕的就是「昨天還好好的」。
+
+          args:
+            - server
+            - /data
+            - --console-address
+            - ":9001"
+
+          ports:
+            - name: s3
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+
+          # --- 憑證從 Secret 來，不落地 manifest ---------------------
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: streaming-secrets
+                  key: MINIO_ROOT_USER
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: streaming-secrets
+                  key: MINIO_ROOT_PASSWORD
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+
+          # MinIO 官方的健康檢查端點。
+          # liveness 只問「process 還活著嗎」，不查下游——設錯會造成雪崩式重啟。
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: s3
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: s3
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+
+  # --- PVC 範本：StatefulSet 的核心機制 -------------------------------------
+  # 每個副本會自動獲得一個獨立的 PVC，命名規則是 <範本名>-<pod名>，
+  # 這裡就是 data-minio-0。
+  #
+  # ⚠️ 兩個要記住的事：
+  #   1. storageClassName 一定要寫 standard（pd-standard，走 DISKS_TOTAL_GB=2048）
+  #      不寫的話會用預設的 standard-rwo（pd-balanced，吃 SSD_TOTAL_GB=250）
+  #   2. 刪掉 StatefulSet **不會**刪 PVC——這是刻意的保護，
+  #      但也表示磁碟會一直計費。不要了要手動 kubectl delete pvc
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 20Gi

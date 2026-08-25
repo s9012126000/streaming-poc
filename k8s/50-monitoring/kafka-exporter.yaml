@@ -1,0 +1,140 @@
+# ---------------------------------------------------------------------------
+# kafka-exporter —— 把 Kafka 的內部狀態翻譯成 Prometheus 指標。
+#
+# 為什麼需要它：Kafka 自己只吐 JMX，Prometheus 讀不懂。
+# 這支 exporter 以一般 consumer 的身分連上叢集，
+# 查 topic offset 與 consumer group 的進度，再轉成 /metrics。
+#
+# 它產出的指標裡，Week 4 的告警規則用到兩個：
+#   kafka_consumergroup_lag              → ConsumerLagGrowing
+#   kafka_topic_partition_{current,oldest}_offset → DLQNotEmpty
+#
+# 對照 compose：
+#   command: --kafka.server=broker-1:29092 ...
+#   → 位址換成 K8s 的 pod FQDN，其餘不變。
+#
+# ⚠️ 這是 Week 8 漏掉的一塊。compose 有、K8s 沒有，
+#    所以那兩條告警規則在 GKE 上其實一直是「永遠不會觸發」的狀態——
+#    表達式引用不存在的指標時，Prometheus 不會報錯，只會回空集合。
+#    **靜默失效的告警比沒有告警更危險**，因為你以為它在看著。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-exporter
+  namespace: streaming
+  labels:
+    app: kafka-exporter
+spec:
+  # Prometheus 靠 pod annotation 自動發現，不需要這個 Service。
+  # 留著純粹是為了除錯方便：
+  #   kubectl port-forward -n streaming svc/kafka-exporter 9308:9308
+  #   → http://localhost:9308/metrics
+  type: ClusterIP
+  selector:
+    app: kafka-exporter
+  ports:
+    - name: metrics
+      port: 9308
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-exporter
+  namespace: streaming
+  labels:
+    app: kafka-exporter
+spec:
+  replicas: 1
+  # 單副本就夠。它是唯讀的查詢者，多開只是重複查同樣的東西，
+  # 還會讓 Prometheus 收到重複的時間序列。
+  selector:
+    matchLabels:
+      app: kafka-exporter
+
+  template:
+    metadata:
+      labels:
+        app: kafka-exporter
+      annotations:
+        # ★ 這三行就是 Prometheus 發現它的全部方式。
+        #   不需要在 prometheus.yml 裡寫任何位址——
+        #   這正是 kubernetes_sd_configs 取代 static_configs 的意義。
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9308"
+        prometheus.io/path: "/metrics"
+    spec:
+      enableServiceLinks: false
+
+      # --- 等 Kafka 真的能連 -----------------------------------------
+      # kafka-exporter 連不上 broker 時會直接退出（不是重試），
+      # 所以在 Kafka 還沒好的時候啟動 = CrashLoopBackOff。
+      initContainers:
+        - name: wait-kafka
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              echo "等待 Kafka（最多 60 次 × 2 秒）..."
+              for i in $(seq 1 60); do
+                if nc -z broker-0.kafka.streaming.svc.cluster.local 9092 2>/dev/null; then
+                  echo "Kafka 可達（第 ${i} 次）"; exit 0
+                fi
+                [ $((i % 10)) -eq 0 ] && echo "  第 ${i} 次仍未就緒"
+                sleep 2
+              done
+              echo "❌ 等待逾時"; exit 1
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+
+      containers:
+        - name: kafka-exporter
+          # 釘住版本。compose 用 latest——那會在你沒預期時變動，
+          # 而 exporter 改版時指標名稱是真的會變的。
+          # 若 ImagePullBackOff，先確認 tag 存在：
+          #   gcloud container images list-tags 或直接查 Docker Hub
+          image: danielqsj/kafka-exporter:v1.7.0
+
+          args:
+            # 三個 broker 都列出來，任一台掛掉仍能取得叢集 metadata。
+            # 用 pod 的 FQDN 而不是 kafka-bootstrap Service——
+            # exporter 要查「每個 broker 各自的」狀態，
+            # 走 ClusterIP 的話每次連到誰是不確定的。
+            - --kafka.server=broker-0.kafka.streaming.svc.cluster.local:9092
+            - --kafka.server=broker-1.kafka.streaming.svc.cluster.local:9092
+            - --kafka.server=broker-2.kafka.streaming.svc.cluster.local:9092
+            # 預設只抓部分 consumer group，這裡全抓——
+            # 我們要看的 flink-bronze-consumer 和 discord-bot-consumer 都要在。
+            - --group.filter=.*
+            - --topic.filter=.*
+
+          ports:
+            - name: metrics
+              containerPort: 9308
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 192Mi
+
+          # exporter 本身就是 HTTP 服務，probe 直接打 /metrics 最實在——
+          # 它回 200 代表「連得上 Kafka 且查得到資料」，是有意義的訊號。
+          # （對照 bot 那個 pgrep probe：那個在設計上就不可能提供資訊。）
+          startupProbe:
+            httpGet: { path: /metrics, port: metrics }
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            periodSeconds: 15
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            periodSeconds: 30
+            failureThreshold: 3

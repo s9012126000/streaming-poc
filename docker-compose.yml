@@ -143,6 +143,7 @@ services:
       kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-trades-clean --partitions 16 --replication-factor 3 &&
       kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-quotes  --partitions 16 --replication-factor 3 &&
       kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-alerts  --partitions 4  --replication-factor 3 &&
+      kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-price-alerts --partitions 4 --replication-factor 3 &&
       kafka-topics --bootstrap-server broker-1:29092 --create --if-not-exists --topic market-dlq     --partitions 4  --replication-factor 3 &&
       echo 'Topics created successfully.' &&
       kafka-topics --bootstrap-server broker-1:29092 --list &&
@@ -193,6 +194,28 @@ services:
   # ──────────────────────────────────────────
   # 5. Iceberg REST Catalog
   # ──────────────────────────────────────────
+  # Iceberg catalog 的後端資料庫。
+  # 從 SQLite 換過來的理由見 k8s/week7/catalog-postgres.yaml：
+  # 兩個 Flink job 同時 commit 時 SQLite 會回 SQLITE_BUSY。
+  catalog-db:
+    image: postgres:17-alpine
+    hostname: catalog-db
+    container_name: catalog-db
+    networks: [data-platform]
+    environment:
+      POSTGRES_DB: iceberg
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: ${CATALOG_DB_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - catalog_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iceberg -d iceberg"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
   iceberg-rest:
     image: tabulario/iceberg-rest:latest
     hostname: iceberg-rest
@@ -201,12 +224,23 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+      catalog-db:
+        condition: service_healthy
     ports:
       - "8181:8181"
     environment:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       AWS_REGION: us-east-1
+      # ★ 2026-08-26。原本沒設 CATALOG_URI，等於用 image 預設的
+      #   in-memory SQLite——容器一重建「有哪些表」全部消失。
+      #   8/25 先改成 SQLite 檔案，8/26 又因為 SQLITE_BUSY 換成 Postgres。
+      #   兩次的完整經過見 doc/updated_plan/week9-decisions.md。
+      #   K8s 與這裡必須一致，否則本機驗證的結果不能拿來推論雲端行為。
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:postgresql://catalog-db:5432/iceberg
+      CATALOG_JDBC_USER: iceberg
+      CATALOG_JDBC_PASSWORD: ${CATALOG_DB_PASSWORD}
       CATALOG_WAREHOUSE: s3://warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://minio:9000
@@ -323,7 +357,7 @@ services:
         condition: service_healthy
       flink-taskmanager:
         condition: service_started
-    entrypoint: ["/bin/sh", "-c", "/opt/flink/bin/sql-client.sh -D rest.address=flink-jobmanager -i /opt/flink/sql/flink-init.sql -f /opt/flink/sql/submit-jobs.sql && /opt/flink/bin/flink run -d -m flink-jobmanager:8081 -py /opt/flink/jobs/bronze_ingest.py"]
+    entrypoint: ["/bin/sh", "-c", "/opt/flink/bin/sql-client.sh -D rest.address=flink-jobmanager -i /opt/flink/sql/flink-init.sql -f /opt/flink/sql/submit-jobs.sql && /opt/flink/bin/flink run -d -m flink-jobmanager:8081 -py /opt/flink/jobs/bronze_ingest.py && /opt/flink/bin/flink run -d -m flink-jobmanager:8081 -py /opt/flink/jobs/volume_anomaly.py && /opt/flink/bin/flink run -d -m flink-jobmanager:8081 -py /opt/flink/jobs/price_anomaly.py"]
     restart: "no"
     volumes:
       - ./docker/flink/sql:/opt/flink/sql
@@ -346,6 +380,10 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - ./docker/trino/etc/catalog:/etc/trino/catalog
+      # heap 比例調低到 50%，理由寫在檔案裡：光給 mem_limit 是不夠的，
+      # 80% 的 heap 會把 JVM 的非 heap 記憶體擠爆，反而更快撞到 cgroup 上限。
+      - ./docker/trino/etc/jvm.config:/etc/trino/jvm.config:ro
+    mem_limit: 2g
     networks: [data-platform]
 
   # ──────────────────────────────────────────
@@ -468,4 +506,5 @@ volumes:
   broker_2_data:
   broker_3_data:
   minio_data:
+  catalog_db_data:     # Iceberg catalog 的 Postgres 資料（見 catalog-db 服務）
   web_node_modules:

@@ -1,0 +1,179 @@
+# ---------------------------------------------------------------------------
+# Alertmanager —— 把 Prometheus 觸發的告警送到 Discord。
+#
+# 分工要分清楚（這是初學最容易混淆的地方）：
+#   Prometheus   決定「什麼時候該告警」（評估規則、PENDING → FIRING）
+#   Alertmanager 決定「怎麼通知」（分組、抑制、靜音、去重、送到哪）
+# 所以規則寫在 Prometheus 的 ConfigMap，收件人寫在這裡。
+#
+# ★ 本檔案的核心差異：webhook URL 不落地
+#
+#   compose 版本是直接把 URL 寫在 monitoring/alertmanager.yml 裡：
+#       webhook_url: "https://discord.com/api/webhooks/REPLACE_ME"
+#   那份檔案會進 git。PoC 時靠「填了就別 commit」硬撐，不是辦法。
+#
+#   ⚠️ 而 Alertmanager **不會展開環境變數** —— 寫 ${DISCORD_WEBHOOK}
+#      只會被當成字面字串送出去，然後 Discord 回 404，
+#      而 Alertmanager 的日誌只會說「通知失敗」，不會說是變數沒展開。
+#      這是它跟 Prometheus / Grafana 不一樣的地方，很多人踩過。
+#
+#   解法是 webhook_url_file：指向一個檔案，內容才是真正的 URL。
+#   把 Secret 掛成檔案，URL 就只存在於記憶體與 etcd，不進 git。
+#
+#   已查證（prometheus/alertmanager 的 configuration.md）：
+#     ### <discord_config>
+#     # webhook_url and webhook_url_file are mutually exclusive.
+#     webhook_url: <secret>
+#     webhook_url_file: <filepath>
+#   兩者互斥——同時寫會啟動失敗，不是其中一個被忽略。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: streaming
+  labels:
+    app: alertmanager
+spec:
+  type: ClusterIP
+  selector:
+    app: alertmanager
+  ports:
+    - name: http
+      port: 9093
+      targetPort: http
+# 注意：compose 因為 host 的 9093 被 broker-2 佔用，對外改成 9095。
+# K8s 沒有這個問題——每個 pod 有自己的 IP，埠不會互相衝突。
+# 這是「compose 的 workaround 在 K8s 上不需要」的例子之一。
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: streaming
+  labels:
+    app: alertmanager
+data:
+  alertmanager.yml: |
+    route:
+      receiver: discord
+      group_by: ["alertname"]
+      group_wait: 10s        # 第一次觸發後等 10 秒，收集同組的其他告警
+      group_interval: 1m     # 同一組有新成員時，最快 1 分鐘再通知一次
+      repeat_interval: 1h    # 同一個告警持續 FIRING，每小時重提醒
+
+    receivers:
+      - name: discord
+        discord_configs:
+          # ★ 不是 webhook_url。值來自掛載的 Secret 檔案。
+          - webhook_url_file: /etc/alertmanager/secrets/discord-webhook
+            send_resolved: true
+            # ↑ 告警解除時也發一則。演練時要看到 RESOLVED，
+            #   否則只證明「會叫」，沒證明「會停」。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: streaming
+  labels:
+    app: alertmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9093"
+      # ⚠️ 這個 annotation 是刻意加的：讓 Prometheus 監控 Alertmanager 自己。
+      #    「告警系統壞掉時沒有人會告訴你」是監控的經典盲點——
+      #    Alertmanager 掛了，所有告警都會靜默消失，
+      #    而畫面上一片綠，看起來比平常更健康。
+    spec:
+      enableServiceLinks: false
+
+      # prom/alertmanager 同樣以 nobody(65534) 執行。
+      # 這裡掛的是 emptyDir 不是 PVC，權限問題比較小，
+      # 但明確寫出來比較安全（Secret 掛載的檔案預設是 root:root 0644，
+      # 唯讀所以沒問題；資料目錄要能寫）。
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.28.1
+
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+
+          ports:
+            - name: http
+              containerPort: 9093
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager/alertmanager.yml
+              subPath: alertmanager.yml
+              # ↑ 用 subPath 掛單一檔案，而不是整個目錄。
+              #   掛目錄的話會蓋掉 /etc/alertmanager 底下所有東西，
+              #   包括下面那個 secrets 子目錄——兩個掛載點會打架。
+            - name: webhook
+              mountPath: /etc/alertmanager/secrets
+              readOnly: true
+            - name: data
+              mountPath: /alertmanager
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 192Mi
+
+          startupProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 15
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            periodSeconds: 30
+            failureThreshold: 3
+
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-config
+
+        # ★ 從既有的 streaming-secrets 挑出一個 key，掛成一個檔案。
+        #   items 讓我們只暴露需要的那一把——不寫 items 的話，
+        #   整個 Secret（含 DISCORD_TOKEN、ALPACA_SECRET_KEY、MinIO 密碼）
+        #   都會變成 /etc/alertmanager/secrets/ 底下的檔案。
+        #   Alertmanager 用不到那些，沒有理由讓它看得到。
+        - name: webhook
+          secret:
+            secretName: streaming-secrets
+            items:
+              - key: DISCORD_WEBHOOK
+                path: discord-webhook
+
+        # 存 silence 與通知紀錄（nflog）。
+        # 用 emptyDir 而不是 PVC 的取捨：
+        #   pod 重建後 silence 會消失，且已送過的通知可能重送一次。
+        #   PoC 可接受，換來省一顆磁碟與一次權限除錯。
+        #   真要長期運作就換 PVC——那時記得 strategy 也要改 Recreate。
+        - name: data
+          emptyDir: {}

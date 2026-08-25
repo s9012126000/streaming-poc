@@ -1,0 +1,78 @@
+# ---------------------------------------------------------------------------
+# Kafka 的共用設定 —— 三個 broker 完全相同的部分。
+#
+# 對應 docker-compose.yml 的 x-kafka-env anchor。
+# 每個 broker 各自不同的部分（NODE_ID、advertised listener）
+# 沒辦法放這裡，要在 StatefulSet 的啟動指令裡依 pod 序號動態算出來。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-config
+  namespace: streaming
+  labels:
+    app: kafka
+data:
+  # --- KRaft 模式（不用 ZooKeeper）------------------------------------
+  KAFKA_PROCESS_ROLES: "broker,controller"
+  KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+  KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+
+  # controller quorum：三個 broker 互相投票選出 controller。
+  # 格式是 <nodeId>@<host>:<port>，host 必須是「解析得到的固定名稱」——
+  # 這就是為什麼一定要 headless Service，pod IP 會變、Service 的 ClusterIP
+  # 又會隨機轉送，兩個都不能用。
+  KAFKA_CONTROLLER_QUORUM_VOTERS: "0@broker-0.kafka.streaming.svc.cluster.local:9093,1@broker-1.kafka.streaming.svc.cluster.local:9093,2@broker-2.kafka.streaming.svc.cluster.local:9093"
+
+  # 兩個 listener 都用明文（PoC 範圍，不做 TLS/SASL）
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+
+  # ⚠️ KAFKA_LISTENERS 不放這裡——它必須依 pod 算出來，見 StatefulSet 的啟動指令。
+  #    原因：CONTROLLER listener 不能綁 0.0.0.0（實測會啟動失敗），
+  #    必須綁該 pod 自己的 FQDN。詳細說明在 StatefulSet 那邊。
+
+  KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+
+  # KRaft 叢集識別碼。三個 broker 必須一致，
+  # 沿用 docker-compose 的值，之後本機資料要搬上來也對得起來。
+  CLUSTER_ID: "7YkApeILRgCTCrfxFxEhjw"
+
+  # --- Topic 設定（沿用 compose）---------------------------------------
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_MIN_INSYNC_REPLICAS: "2"          # 至少 2 個副本同步才回 ack
+
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+
+  # --- Retention -------------------------------------------------------
+  KAFKA_LOG_RETENTION_HOURS: "168"
+
+  # ⚠️ retention.bytes 是「每個分區」的上限，不是每個 topic、更不是每個 broker。
+  #    很容易低估，實際要這樣算：
+  #
+  #      6 個 topic 共 60 個分區（16×3 + 4×3）
+  #      × RF=3          = 180 個分區副本
+  #      ÷ 3 個 broker   = 每台承載 60 個分區副本
+  #
+  #      每分區 5GB  → 每台 300GB   ❌ 磁碟只有 20Gi
+  #      每分區 1GB  → 每台  60GB   ❌
+  #      每分區 256MB→ 每台  15GB   ✅ 留約 5GB 餘裕
+  #
+  #    compose 原本寫 100GB/分區，在本機因為資料量小從沒觸發，
+  #    但那等於「沒有上限保護」——上雲後磁碟是付費且固定的，
+  #    這個數字必須真的算過。
+  KAFKA_LOG_RETENTION_BYTES: "268435456"      # 256MB / 分區
+
+  # --- 效能 -------------------------------------------------------------
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "3000"
+  # segment 要明顯小於 retention.bytes，否則刪除的粒度太粗——
+  # Kafka 是整個 segment 一起刪的，segment 和 retention 一樣大的話
+  # 等於「不到上限不刪，一刪就清空」。64MB 讓每個分區有 4 個 segment。
+  KAFKA_LOG_SEGMENT_BYTES: "67108864"         # 64MB
+  KAFKA_NUM_RECOVERY_THREADS_PER_DATA_DIR: "2"
+
+  # JVM heap。容器 limit 是 2Gi，heap 給 1G，
+  # 剩下留給 page cache 和 JVM 本身的額外開銷（metaspace、執行緒堆疊）。
+  # heap 開太接近 limit 會直接 OOMKilled。
+  KAFKA_HEAP_OPTS: "-Xms512m -Xmx1G"

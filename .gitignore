@@ -3,8 +3,12 @@ __pycache__/
 node_modules/
 web/dist/
 
-doc/
 
+/.bk
 /bk
 .env
+*.bak
 *.jar
+# k8s Secret 一律用 scripts/gcp/07-create-secrets.sh 從 .env 生成，不進 git
+k8s/**/secret*.yaml
+k8s/**/*-secret.yaml

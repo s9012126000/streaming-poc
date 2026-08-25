@@ -1,740 +1,626 @@
-# 🔬 技術深度手冊 — 所有使用技術的背景知識、原理、優勢與雲端對應服務
+# 技術選型手冊
 
-> 本文件涵蓋 NASDAQ Streaming POC 中所有使用到的開源技術，  
-> 包含：背景歷史、核心原理、設計優勢、使用限制與三大雲端的對應服務。
-
----
-
-## 目錄
-
-0. [Apache ZooKeeper](#0-apache-zookeeper)
-1. [Apache Kafka](#1-apache-kafka)
-2. [Confluent Schema Registry](#2-confluent-schema-registry)
-3. [Apache Flink 2.0](#3-apache-flink-20)
-4. [Apache Iceberg](#4-apache-iceberg)
-5. [MinIO](#5-minio)
-6. [Apache Airflow](#6-apache-airflow)
-7. [Trino](#7-trino)
-8. [Apache Superset](#8-apache-superset)
-9. [Prometheus + Grafana](#9-prometheus--grafana)
-10. [OpenLineage + Marquez](#10-openlineage--marquez)
-11. [Flink Kubernetes Operator](#11-flink-kubernetes-operator)
-12. [Alpaca Markets WebSocket](#12-alpaca-markets-websocket)
+> 這個專案實際用到的每一項技術：它在這裡做什麼、為什麼是它、代價是什麼。
+>
+> 跟其他文件的分工：
+> - [`doc/knowledge/`](knowledge/) — **概念**：這個東西怎麼運作
+> - 本文件 — **選型**：為什麼選它、放棄了什麼
+>
+> 每一節的「實際踩到的」都是這個專案真的發生過的事，不是通則。
 
 ---
 
-## 0. Apache ZooKeeper
+## 版本清單
 
-### 背景
+全部釘住版本。`latest` 只用在自建 image（配 `imagePullPolicy: Always`），
+因為那些是我們自己 build 的，內容可控。
 
-ZooKeeper 由 Yahoo! 工程師於 2007 年開發，2008 年正式開源並捐贈給 Apache 基金會，2011 年成為 Apache 頂級專案。名稱來自一個比喻：「分散式系統就像一個動物園（Zoo），管理它們需要一位專業的動物園管理員（Keeper）」。
-
-最初為了解決 Yahoo! 內部 Hadoop 叢集的分散式協調問題而誕生，後來被 Apache Kafka、HBase、Hadoop YARN、Apache Flink 等幾乎所有主流分散式系統採用。
-
-### 核心原理
-
-ZooKeeper 本質上是一個**分散式協調服務（Distributed Coordination Service）**，提供一個類似檔案系統的階層式 Key-Value 樹狀結構（稱為 ZNode），並在此基礎上實現分散式系統最需要的協調原語（Primitive）。
-
-```
-ZooKeeper ZNode 樹狀結構（以 Kafka 為例）：
-
-/
-├── /kafka
-│   ├── /kafka/brokers
-│   │   ├── /kafka/brokers/ids
-│   │   │   ├── /kafka/brokers/ids/1   ← Broker 1 存活（Ephemeral Node）
-│   │   │   └── /kafka/brokers/ids/2   ← Broker 2 存活（Ephemeral Node）
-│   │   └── /kafka/brokers/topics
-│   │       └── /kafka/brokers/topics/market-trades/partitions/...
-│   ├── /kafka/controller             ← 當前 Controller Broker（Ephemeral）
-│   └── /kafka/config
-│       └── /kafka/config/topics/...  ← Topic 設定（Persistent Node）
-```
-
-**ZNode 類型**：
-
-| 類型 | 說明 | Kafka 使用場景 |
+| 元件 | 版本 | 備註 |
 |---|---|---|
-| **Persistent Node** | 永久存在，需手動刪除 | Topic 設定、ACL、分區配置 |
-| **Ephemeral Node** | 建立者連線斷開後自動刪除 | Broker 心跳、Controller 選舉 |
-| **Sequential Node** | 自動附加遞增編號 | 分散式鎖的實現 |
-| **Ephemeral Sequential** | 以上兩者結合 | Leader 選舉演算法 |
+| Kafka | `confluentinc/cp-kafka:7.9.0` | KRaft 模式，無 ZooKeeper |
+| Schema Registry | `confluentinc/cp-schema-registry:7.9.0` | |
+| Flink | `apache/flink:2.0.2-scala_2.12` | + Iceberg 1.10.1、Kafka connector 4.0.1 |
+| Iceberg REST Catalog | `tabulario/iceberg-rest:1.6.0` | 後端接 Postgres |
+| Postgres | `postgres:17-alpine` | 只當 Iceberg catalog 的後端 |
+| MinIO | `quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z` | S3 相容物件儲存 |
+| Trino | `trinodb/trino:476` | |
+| Prometheus | `prom/prometheus:v3.1.0` | |
+| Alertmanager | `prom/alertmanager:v0.28.1` | |
+| Grafana | `grafana/grafana:11.5.1` | |
+| kafka-exporter | `danielqsj/kafka-exporter:v1.7.0` | |
+| nginx | `nginx:1.27-alpine` | 前端靜態檔 + 反向代理 |
+| Python | `python:3.12-slim` | producer / gateway / bot |
+| Node | `node:22-alpine` | 只在 build 階段 |
 
-**ZooKeeper 提供的四大協調原語**：
-
-1. **Leader Election（Leader 選舉）**
-   多個節點同時嘗試建立同一個 Ephemeral Sequential ZNode，序號最小者成為 Leader。若 Leader 死亡，其 Ephemeral Node 消失，其他節點收到通知重新選舉。
-   → Kafka 用此選出 Controller Broker，由 Controller 管理 Partition Leader 分配。
-
-2. **Service Discovery（服務發現）**
-   每個 Broker 啟動時在 `/kafka/brokers/ids/` 建立 Ephemeral Node，寫入自己的 host:port 資訊。Broker 崩潰時，ZooKeeper 自動刪除該節點。
-   → Producer/Consumer 透過 ZooKeeper 知道哪些 Broker 目前存活。
-
-3. **Distributed Lock（分散式鎖）**
-   利用 Ephemeral Sequential ZNode 實現公平鎖（Fair Lock）：每個競爭者建立一個帶序號的節點，序號最小者持有鎖，釋放鎖即刪除節點。
-
-4. **Watcher / Event Notification（事件通知）**
-   客戶端可以對任意 ZNode 設定 Watcher，當節點發生變化（建立/刪除/修改）時，ZooKeeper 立即向客戶端發送通知（one-time trigger）。
-   → Kafka Consumer Rebalance 的觸發機制。
-
-**ZooKeeper 的一致性保證（ZAB 協議）**：
-
-ZooKeeper 使用 **ZAB（ZooKeeper Atomic Broadcast）** 協議確保資料一致性，原理類似 Raft：
-
-```
-ZooKeeper Ensemble（奇數個節點，通常 3 或 5 個）
-
-Client Write Request
-        │
-        ▼
-  ┌─────────────┐
-  │   Leader    │  ← 所有寫入都經過 Leader
-  └──────┬──────┘
-         │ 廣播 PROPOSAL
-    ┌────▼─────┐    ┌──────────┐
-    │Follower A│    │Follower B│
-    └────┬─────┘    └─────┬────┘
-         │ ACK             │ ACK
-         └────────┬────────┘
-                  ▼
-          超過半數 ACK → Leader 發送 COMMIT → 回應 Client
-```
-
-- **Quorum（法定人數）**：超過半數節點同意才能提交寫入
-- **3 節點 Ensemble**：允許 1 個節點故障
-- **5 節點 Ensemble**：允許 2 個節點故障
-- **強一致性**：任意節點讀到的資料一定是已提交的最新版本
-
-### ZooKeeper 在 Kafka 中的角色
-
-| ZooKeeper 管理的 Kafka 元數據 | 說明 |
-|---|---|
-| Broker 的存活狀態 | Broker 心跳透過 Ephemeral Node 維護 |
-| Controller 選舉 | 決定哪個 Broker 是 Controller |
-| Partition Leader 資訊 | 每個 Partition 目前的 Leader 是哪個 Broker |
-| Topic 設定 | Topic 的分區數、replication factor、保留策略 |
-| ISR（In-Sync Replicas）| 追上 Leader 的副本列表 |
-
-### ZooKeeper 的限制與 KRaft 的崛起
-
-| 問題 | 說明 |
-|---|---|
-| **Controller 瓶頸** | 重啟時需從 ZooKeeper 全量重載元數據，10 萬 Partition 可能要幾十秒 |
-| **雙系統維運負擔** | 需同時維運 Kafka 和 ZooKeeper 兩套叢集 |
-| **Partition 數量上限** | 生產環境建議不超過 20 萬個 Partition |
-| **強依賴外部系統** | ZooKeeper 掛掉，整個 Kafka 叢集停擺 |
-
-**KRaft 模式（Kafka 4.0 預設，正式移除 ZooKeeper 依賴）**：
-
-```
-KRaft 架構 — 不再需要獨立 ZooKeeper
-
-┌────────────────────────────────────────┐
-│         Kafka KRaft Cluster            │
-│                                        │
-│  Controller Quorum（3 節點，用 Raft）  │
-│  元數據存於 __cluster_metadata Topic   │
-│                                        │
-│  Broker 1   Broker 2   Broker 3        │
-│（Broker 可同時擔任 Controller 角色）   │
-└────────────────────────────────────────┘
-
-✅ 移除 ZooKeeper，單一系統維運
-✅ Partition 上限從 20 萬 → 百萬級別
-✅ Controller 重啟從分鐘級 → 秒級
-```
-
-**本 POC 使用 ZooKeeper 的原因**：使用 `confluentinc/cp-kafka:7.5.0`，此版本預設仍採用 ZooKeeper 模式。升級到 Confluent Platform 8.x 或 Apache Kafka 4.x 後，可切換 KRaft 模式直接移除 ZooKeeper 容器。
-
-### 優勢
-
-- **高可用**：Ensemble 設計，部分節點故障不影響服務
-- **強一致性**：ZAB 協議保證所有客戶端看到相同的資料狀態
-- **通用協調原語**：Leader 選舉、分散式鎖、事件通知，任何分散式系統都可使用
-- **成熟穩定**：超過 15 年的大規模生產驗證
-
-### 雲端對應服務
-
-ZooKeeper 作為基礎協調服務，在雲端通常被各託管服務隱藏，不需使用者自行管理：
-
-| 雲端 | 對應方式 | 說明 |
-|---|---|---|
-| **AWS** | Amazon MSK 內建 | MSK 自動管理 ZooKeeper 或 KRaft，使用者完全不需接觸 |
-| **GCP** | Cloud Pub/Sub 架構內建 | 完全不需要 ZooKeeper |
-| **Azure** | Azure Event Hubs 內建 | 完全不需要 ZooKeeper |
-| **自管 K8s** | Strimzi Kafka Operator | 自動部署並管理 ZooKeeper 或 KRaft 模式的 Kafka |
-| **協調服務替代** | **etcd**（K8s 使用）、**Consul**（HashiCorp）| 現代系統多改用 etcd 或 Consul 作為協調服務 |
+工具型 image（只出現在 initContainer 與一次性 Job）：
+`curlimages/curl:8.11.1`（等待依賴就緒）、
+`quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z`（建 bucket）。
+這兩個也釘版本——**initContainer 壞掉的症狀是 pod 卡在 `Init:0/1`，
+比主容器壞掉更難察覺**。
 
 ---
 
-## 1. Apache Kafka
+# 一、攝取層
 
-### 背景
+## Binance / Alpaca WebSocket
 
-Kafka 於 2010 年由 LinkedIn 工程師 Jay Kreps 等人開發，2011 年開源捐贈給 Apache 基金會。  
-最初設計目的是解決 LinkedIn 內部海量行為事件（瀏覽、點擊）的即時傳輸問題。  
-2014 年 Jay Kreps 等人創辦 Confluent 公司，圍繞 Kafka 建構完整的企業級串流平台。
+**做什麼**：兩個外部行情來源。`main_producer.py` 依美股交易時段切換——
+盤中跑 Alpaca（NASDAQ 前 30 支），其餘時間跑 Binance（加密貨幣，24 小時）。
 
-### 核心原理
+**為什麼是 WebSocket 而不是 REST 輪詢**：行情是 push 型的資料。
+輪詢要嘛太慢（漏掉成交）要嘛太吵（大部分請求回空）。WebSocket 一條長連線，
+交易所有資料就推過來——這是 streaming 專案的起點，也是「為什麼需要 Kafka」的理由：
+**上游的速率你控制不了**。
 
-Kafka 的本質是一個**分散式、持久化的日誌系統（Distributed Commit Log）**，而非傳統意義上的訊息佇列。
+**實際踩到的**：Binance 對某些地區有 geo-block。專案原本在 `us-central1`，
+producer 連不上，最後把整個叢集搬到 `asia-east1`（台灣）。
+> 資料來源的地理限制會反過來決定叢集的位置——這在規劃階段完全沒想到。
+
+## `confluent-kafka` (Python)
+
+**做什麼**：producer / gateway / bot 都用它。底層是 C 寫的 `librdkafka`，
+比純 Python 的 `kafka-python` 快得多，而且 Avro 與 Schema Registry 的整合是官方的。
+
+**核心原理**：`produce()` 是**非同步**的——它只是把訊息丟進本地緩衝區就返回。
+真正的送出由背景執行緒批次處理。所以：
+
+```python
+p.produce(topic, value=data)   # 不會阻塞，也不保證送到
+p.flush()                      # 這裡才等待
+```
+
+**實際踩到的兩件事**：
+
+`acks` 預設就是 `all`（librdkafka v1.0.0 起），計畫裡列的「要設 acks=all」是多慮的。
+但 **`enable.idempotence` 預設是 `false`**——網路抖動觸發重試就可能寫入重複訊息，
+而 Spot 環境的抖動不會少。這是專案目前**還沒補上**的缺口。
+
+`confluent-kafka[avro,schemaregistry]` 的 extras 要寫對，少一個就 import 失敗。
+
+## Avro + Schema Registry
+
+**做什麼**：`schemas/market_trade.avsc` 定義成交的欄位。producer 送出前用它序列化，
+Flink 讀取時用它反序列化。
+
+**核心原理 —— Confluent wire format**：
 
 ```
-Topic: nasdaq-trades
-│
-├── Partition 0: [msg@offset:0] [msg@offset:1] [msg@offset:2] ...
-├── Partition 1: [msg@offset:0] [msg@offset:1] ...
-├── Partition 2: [msg@offset:0] [msg@offset:1] ...
-└── ...（共 16 Partitions）
-
-Consumer Group: flink-bronze-consumer
-├── Consumer A  → 讀取 Partition 0, 1, 2, 3
-├── Consumer B  → 讀取 Partition 4, 5, 6, 7
-├── Consumer C  → 讀取 Partition 8, 9, 10, 11
-└── Consumer D  → 讀取 Partition 12, 13, 14, 15
+[0x00][4-byte schema id][Avro binary payload]
+  ↑        ↑
+  魔術位元組  註冊表裡的 schema ID
 ```
 
-**關鍵設計決策**：
-- **Partition（分區）**：Topic 的水平分片單位，決定了最大並行消費度。Partition 數量 = 最大 Consumer 並行數。
-- **Offset（偏移量）**：訊息在 Partition 中的唯一序號。Consumer 可以重播任意 Offset 的訊息。
-- **Replication（副本）**：每個 Partition 有一個 Leader 和多個 Follower。Leader 崩潰時，Follower 自動晉升，實現高可用。
-- **Retention（保留）**：訊息不會在被消費後刪除，而是根據時間或大小閾值刪除（預設 7 天）。
-- **Log Compaction（日誌壓縮）**：特殊模式，保留每個 Key 的最新一條訊息，適合 CDC 事件。
+訊息本身**不帶 schema**，只帶一個 ID。這是它比 JSON 省的地方——
+欄位名不會在每一則訊息裡重複一次。
 
-### 傳遞語意
+**為什麼需要 Registry**：schema 演進。生產者加了一個欄位，
+舊的消費者不該因此爆掉。Registry 在註冊時做相容性檢查（預設 `BACKWARD`），
+不相容就直接拒絕註冊——**把「會不會爆」從執行期挪到部署期**。
 
-| 語意 | 說明 | 適用場景 |
-|---|---|---|
-| At-Most-Once | 訊息可能遺失，但不會重複 | 日誌、指標（允許少量遺失） |
-| At-Least-Once | 訊息不會遺失，但可能重複 | 一般業務事件（下游要做去重） |
-| Exactly-Once | 不遺失也不重複（需 Kafka Transactions） | 金融交易、帳務系統 |
+**取捨**：多一個必須先啟動的服務，而且 producer 和 consumer 都要連得到它。
+換來的是「資料格式」變成一個有版本、可驗證的東西，而不是口頭約定。
 
-本 POC 使用 **Exactly-Once**，搭配 Flink Checkpoint 和 Iceberg Two-Phase Commit 實現端到端保證。
-
-### 優勢
-
-- **極高吞吐量**：單 broker 可達每秒數百萬訊息（取決於硬體與訊息大小）
-- **持久化**：訊息寫入磁碟，重啟後不遺失
-- **解耦**：Producer 和 Consumer 完全獨立，Consumer 可以獨立控制消費速度
-- **可重播（Replayability）**：Consumer 可以隨時回到任意 Offset 重新消費
-
-### 限制
-
-- 運維複雜度高（Broker、Zookeeper/KRaft、Partition Rebalance）
-- Partition 數量設定後難以縮減（只能增加）
-- 不原生支援延遲訊息或優先級佇列
-
-### 雲端對應服務
-
-| 雲端 | 服務名稱 | 特色 | 選擇建議 |
-|---|---|---|---|
-| **AWS** | **Amazon MSK**（Managed Streaming for Apache Kafka） | 完全相容 Kafka API，支援 KRaft 模式，Multi-AZ 自動 HA | AWS 原生優先選擇；另有 MSK Serverless（按用量計費）|
-| **AWS** | **Amazon Kinesis Data Streams** | 非 Kafka 協議，與 AWS 生態系深度整合，Serverless | 不需遷移現有 Kafka 代碼時考慮 |
-| **GCP** | **Google Cloud Pub/Sub** | 全託管、全球分散式、自動擴縮，但不相容 Kafka 協議 | GCP 原生應用，不需 Kafka 生態系時選用 |
-| **Azure** | **Azure Event Hubs** | 提供 Kafka 協議端點（Kafka API 相容），但有部分限制 | Azure 生態系，且現有 Kafka 代碼需遷移時 |
-| **Multi-Cloud** | **Confluent Cloud** | 完整 Kafka + Flink + Schema Registry 一體化平台，三雲均支援 | 需要完整 Confluent 平台能力或跨雲部署 |
+**雲端對應**：AWS Glue Schema Registry、Confluent Cloud、GCP 沒有原生對應
+（通常直接用 Confluent Cloud 或自架）。
 
 ---
 
-## 2. Confluent Schema Registry
+# 二、匯流排
 
-### 背景
+## Apache Kafka（KRaft 模式）
 
-Schema Registry 是 Confluent 在 2015 年開源的元件，解決 Kafka 訊息格式管理問題。  
-在沒有 Schema Registry 的情況下，Producer 和 Consumer 對訊息格式的理解完全依賴「口頭約定」，一旦欄位更改，Consumer 就會崩潰。
+**做什麼**：整個系統的資料匯流排。六個 topic：
 
-### 核心原理
-
-```
-Producer                Schema Registry              Consumer
-  │                           │                          │
-  ├──"我要寫 StockTrade"──────▶│                          │
-  │◀──Schema ID: 42 ──────────│                          │
-  │                           │                          │
-  ├──[Magic Byte][Schema ID 42][Avro Payload]────────────▶│
-  │                           │◀── "Schema 42 是什麼？" ─┤
-  │                           │──────── Schema 定義 ─────▶│
-  │                           │                          │
-```
-
-每個 Avro 訊息的前 5 個 Byte 包含：
-- `0x00`（Magic Byte）：標識這是 Schema Registry 訊息
-- `schema_id`（4 Bytes）：對應 Schema Registry 中的版本 ID
-
-**相容性策略**：
-
-| 策略 | 說明 | 適用場景 |
+| topic | partition | 用途 |
 |---|---|---|
-| `BACKWARD` | 新 Schema 可以讀取舊資料（預設）| 新增 optional 欄位 |
-| `FORWARD` | 舊 Schema 可以讀取新資料 | 刪除 optional 欄位 |
-| `FULL` | 雙向相容 | 嚴格 Schema 管控 |
-| `BACKWARD_TRANSITIVE` | 新 Schema 可讀取所有歷史版本 | 本 POC 推薦設定 |
+| `market-trades` | 16 | 原始成交 |
+| `market-trades-clean` | 16 | 清洗後 |
+| `market-quotes` | 16 | 報價 |
+| `market-alerts` | 4 | 量能異常 |
+| `market-price-alerts` | 4 | 價格跳動 |
+| `market-dlq` | 4 | 死信 |
 
-### 雲端對應服務
+全部 `replication-factor 3`。
 
-| 雲端 | 服務 | 說明 |
-|---|---|---|
-| **AWS** | AWS Glue Schema Registry | 免費，支援 Avro/JSON/Protobuf，與 MSK 整合 |
-| **GCP** | Confluent Cloud Schema Registry | Pub/Sub 本身無原生 Schema Registry，需用 Confluent Cloud |
-| **Azure** | Azure Schema Registry（Event Hubs） | 支援 Avro/JSON，與 Event Hubs 深度整合 |
+**核心原理**：Kafka 是一個**分散式的、可重讀的 append-only log**。
+這句話裡每個詞都重要：
+
+- **append-only**：只能往後加，不能改。所以寫入極快（順序 I/O）
+- **可重讀**：消費不是「取走」，是「移動自己的 offset」。
+  同一批資料可以被多個 consumer group 各自從頭讀一次
+- **分散式**：topic 切成 partition 分散在多個 broker，
+  **partition 是平行度的單位**——16 個 partition 最多支撐 16 個平行消費者
+
+**為什麼這個專案需要它**：三個理由，缺一個都可以不用 Kafka。
+
+1. **削峰**：上游速率你控制不了，下游處理速度有限。Kafka 當緩衝
+2. **扇出**：同一份成交資料，Flink 要算 VWAP、bot 要看告警、
+   未來還可能有別的消費者。**一份寫入、多方獨立消費**
+3. **可重放**：Flink job 掛掉重跑時，從 checkpoint 記錄的 offset 接續，
+   不用回頭跟交易所要資料（也要不到）
+
+**KRaft vs ZooKeeper**：Kafka 3.3 起 KRaft 生產可用，3.5 起 ZooKeeper 標記棄用。
+KRaft 把 metadata 存進 Kafka 自己的一個內部 topic，由 controller quorum 管理——
+**少養一個叢集，少一個要監控、要備份、要升級的東西**。
+本專案直接用 KRaft，沒碰過 ZooKeeper。
+
+**實際踩到的**：
+
+**`advertised.listeners` 是搬上 K8s 最容易卡的一關。** Kafka 的 client
+第一次連上任一 broker 之後，會拿到一份「所有 broker 的位址」清單，
+之後直接連對應的 partition leader。所以那份清單裡的位址**必須是 client 連得到的**：
+
+```bash
+FQDN="${POD_NAME}.kafka.streaming.svc.cluster.local"
+export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${FQDN}:9092"
+```
+
+寫成 `0.0.0.0` 會讓 client 拿到一個無意義的位址。
+這也是 Kafka 必須用 StatefulSet 的原因——**pod 名字要穩定**。
+
+**quorum 需要奇數且過半。** 三個 broker 的 KRaft quorum，容忍一台掛掉。
+兩台的話任何一台掛掉就失去多數——這是本專案把 node 從 2 台加到 3 台的理由，
+**節點數是為 quorum 決定的，不是為算力**。
+
+詳見 [`doc/knowledge/kb-kafka.md`](knowledge/kb-kafka.md)。
+
+**雲端對應**：AWS MSK、GCP Managed Service for Kafka、Azure Event Hubs（Kafka 相容）、
+Confluent Cloud。托管版省掉的主要是「broker 的維運」，
+而 partition 設計、consumer group、offset 管理這些**還是你的責任**。
+
+## kafka-exporter
+
+**做什麼**：把 Kafka 的內部狀態翻譯成 Prometheus 指標。
+Kafka 自己只吐 JMX，Prometheus 讀不懂。
+
+**實際踩到的**：這是 Week 8 漏掉的一塊。沒有它，
+`ConsumerLagGrowing` 和 `DLQNotEmpty` 兩條告警規則引用的指標根本不存在——
+而 **Prometheus 對不存在的指標不報錯，只回空集合**。
+告警永遠不觸發，`/alerts` 顯示綠色，跟「一切正常」長得一模一樣。
+
+> **靜默失效的告警比沒有告警更危險。**
 
 ---
 
-## 3. Apache Flink 2.0
+# 三、運算
 
-### 背景
+## Apache Flink 2.0
 
-Flink 源於 2010 年的柏林工業大學研究計畫「Stratosphere」，2014 年加入 Apache 基金會。  
-2016 年後被 Alibaba 大規模採用（雙十一即時資料處理），成為全球最高吞吐量的串流引擎之一。  
-2025 年 3 月 Apache Flink 2.0 正式發布，帶來 Materialized Table、全新的批流統一 API 等重大更新。  
-Netflix、Uber、Airbnb、Stripe 等頂尖科技公司均在生產環境大規模使用 Flink。
+**做什麼**：四個常駐 streaming job。
 
-### 核心原理
-
-Flink 將一切資料都視為**流（Stream）**：有界批次資料是「有限長度的流」，無界串流是「無限長度的流」，兩者統一使用同一套 API 和執行引擎。
-
-```
-                 Flink 執行模型
-
-Source → [Operator 1] → [Operator 2] → [Operator 3] → Sink
-            ↕ State         ↕ State
-         (RocksDB)       (RocksDB)
-            ↕ Checkpoint
-         (S3/MinIO)
-```
-
-**時間語意**：
-
-| 時間類型 | 說明 | 使用場景 |
+| job | 寫法 | 做什麼 |
 |---|---|---|
-| **Event Time** | 事件發生的實際時間（資料中的 `trade_ts`）| 準確計算，需要 Watermark 處理遲到事件 |
-| **Processing Time** | Flink 處理事件的當前系統時間 | 低延遲，但結果不可重現 |
-| **Ingestion Time** | 事件進入 Flink 的時間 | 介於兩者之間，較少使用 |
+| `insert_bronze_trades` | SQL | Kafka → Iceberg bronze（原樣落地） |
+| `vwap-1min-silver` | SQL | 1 分鐘視窗 VWAP → Iceberg silver |
+| `volume-anomaly-mad` | PyFlink | 量能異常（MAD）→ Kafka alerts |
+| `price-anomaly-jump` | PyFlink | 價格跳動 → Kafka alerts |
 
-本 POC 使用 **Event Time**，配合 Watermark 處理 IEX 資料可能的亂序情況。
+**為什麼是 Flink 而不是 Spark Streaming**：
 
-**Watermark 機制**：
-
-```
-Event Stream: [e@10:00:01] [e@10:00:03] [e@10:00:02 ← 遲到] [e@10:00:05]
-                                                      ↑
-Watermark 策略: trade_ts - 200ms                 這筆在 Watermark 推進後到達
-                                                  若已過容忍期限，該事件被丟棄或路由到 DLQ
-```
-
-**Checkpoint 機制（Exactly-Once 的基礎）**：
-
-Flink 使用 **Chandy-Lamport 分散式快照演算法** 定期為所有 Operator 的狀態打快照：
-1. JobManager 向所有 Source 插入 Checkpoint Barrier 訊號
-2. Barrier 像「水位標記」一樣在資料流中流動
-3. 每個 Operator 收到 Barrier 時，將自身狀態寫入 Checkpoint Storage（MinIO/S3）
-4. 全部 Operator 完成後，JobManager 確認此 Checkpoint 有效
-5. 崩潰時，所有 Operator 從最新 Checkpoint 恢復，Kafka Offset 也回退到對應位置
-
-### Flink 2.0 新特性
-
-- **Materialized Table**：宣告式資料管道，自動決定 Streaming 或 Batch 執行模式
-- **Dynamic Iceberg Sink**：自動偵測 Schema 變化，動態新增 Iceberg 欄位
-- **Disaggregated State Management**：State Backend 從 TaskManager 本地分離，支援更大的狀態
-
-### 優勢
-
-- **真正低延遲**：event-by-event 處理，延遲可達毫秒級（Spark Streaming 是微批，延遲秒級）
-- **精確的 Exactly-Once**：端到端 Exactly-Once 語意，不需下游去重
-- **Stateful Processing**：強大的狀態管理，天然支援跨事件的聚合、Join、Pattern Detection
-- **批流統一**：同一套代碼可以跑 Batch 和 Streaming，簡化維護
-
-### 雲端對應服務
-
-| 雲端 | 服務 | 說明 |
+| | Flink | Spark Structured Streaming |
 |---|---|---|
-| **AWS** | **Amazon Managed Service for Apache Flink** | 2023 年從 Kinesis Data Analytics 改名，完全託管的 Flink 服務，支援 Java/Python/SQL API，與 Kinesis/MSK 深度整合，自動擴縮 |
-| **GCP** | **Google Cloud Dataflow** | 基於 Apache Beam 的託管串流服務；也可透過 Confluent Cloud for Flink 在 GCP 使用完整 Flink |
-| **Azure** | **Azure HDInsight on AKS（Flink）** | 在 K8s 上的託管 Flink；也可使用 Azure Stream Analytics（非 Flink 相容） |
-| **Multi-Cloud** | **Confluent Cloud for Apache Flink** | 2024 年 GA，三雲均可使用，與 Confluent Kafka 深度整合，全 Serverless |
+| 模型 | 真正的逐筆流式 | micro-batch |
+| 延遲 | 毫秒級 | 秒級（受 batch interval 限制） |
+| 事件時間 | 一等公民（watermark 內建） | 支援但較晚成熟 |
+| 狀態 | RocksDB，可增量 checkpoint | 有，但設計偏批次 |
+
+行情資料的異常偵測要的是「這一筆進來時就判斷」，不是「等 5 秒湊一批」。
+**如果需求是每小時跑一次報表，Spark 會是更省事的選擇。**
+
+**核心原理 —— 三個必須理解的東西**：
+
+**① 事件時間與 watermark。** 資料可能亂序到達（網路、多來源）。
+watermark 是一個「我認為 T 之前的資料都到齊了」的宣告，
+視窗靠它決定何時關閉並輸出。
+
+```
+table.exec.source.idle-timeout: 30s
+```
+
+這行很關鍵：**沒有資料流入的 partition 會擋住 watermark 前進**，
+導致視窗永遠不觸發。16 個 partition 裡有幾個冷門標的沒成交，
+整個 VWAP 就卡住了。設 30 秒把閒置的 partition 排除在 watermark 計算之外。
+
+**② Checkpoint 與 exactly-once。** 每 60 秒對所有運算元的狀態做一次一致性快照，
+寫到 MinIO。掛掉時從最近的 checkpoint 恢復，Kafka offset 也一併回滾——
+所以是「重放但不重複」。
+
+```
+execution.checkpointing.interval: 60s
+execution.checkpointing.mode: EXACTLY_ONCE
+state.checkpoints.dir: s3://warehouse/checkpoints
+```
+
+**狀態寫在物件儲存而不是本地磁碟**，這是 TaskManager 能當無狀態 Deployment
+的原因——被 Spot 回收後新 pod 從 S3 恢復即可。
+
+**③ JobManager 與 TaskManager。** JM 是大腦（排程、協調 checkpoint），
+TM 是手腳（實際運算）。**只有 JM 有狀態**（job graph 在記憶體），
+所以只有它需要 HA。
+
+**實際踩到的**：
+
+**standalone 模式沒有 HA 的話，JM 一重建 = 所有 job 永久消失。**
+日誌會說 `Successfully recovered 0 persisted job graphs`——
+它不是報錯，是誠實地說「沒東西可以撿」。而 MinIO 裡的 checkpoint 還在，
+變成沒人認領的孤兒。**存檔還在，但遊戲忘了你有存過檔。**
+
+解法是 Kubernetes HA：job graph 本體寫 S3、指標寫 K8s ConfigMap、
+leader 選舉用 Lease。四行設定 + 一份 RBAC。
+詳見 [`doc/knowledge/distributed-coordination.md`](knowledge/distributed-coordination.md)。
+
+**記憶體要留餘裕。** `jobmanager.memory.process.size: 1400m` 配
+`limits.memory: 2Gi`——差的那 600MB 給 RocksDB 的堆外記憶體和 JVM 開銷。
+設太接近就是週期性 OOMKilled，**而且日誌不會說是記憶體問題**。
+
+**為什麼沒用 Flink Kubernetes Operator**：Operator 把「提交 job」變成
+apply 一個 CRD，聲明式、也更接近生產做法。沒用是因為
+**這個專案的目的是學會原生物件怎麼串**——用 Operator 就跳過了
+JM/TM 部署、HA 設定、RBAC 這些。這是刻意的取捨，不是 Operator 不好。
+
+**雲端對應**：AWS Managed Service for Apache Flink（原 Kinesis Data Analytics）、
+GCP Dataflow（Beam 模型，非 Flink API）、Azure HDInsight、Ververica Platform。
+
+## PyFlink vs Flink SQL
+
+專案兩種都用。分界很清楚：
+
+| | 用在哪 | 為什麼 |
+|---|---|---|
+| **SQL** | bronze 落地、VWAP 聚合 | 純粹的投影與視窗聚合，SQL 表達得最短 |
+| **PyFlink** | MAD 異常、價格跳動 | 需要自訂邏輯與狀態，SQL 寫不出來（或寫出來沒人看得懂） |
+
+SQL 的優勢是**改一行不用重 build image**（掛在 ConfigMap 裡）。
+PyFlink 的代價是 Python 與 JVM 之間的序列化開銷。
 
 ---
 
-## 4. Apache Iceberg
+# 四、湖倉
 
-### 背景
+## Apache Iceberg
 
-Iceberg 由 Netflix 工程師 Ryan Blue 等人於 2017 年設計，2018 年開源捐贈給 Apache 基金會，  
-2020 年成為 Apache 頂級專案。設計目的是解決傳統 Hive 表格格式在大規模資料湖中的諸多問題：  
-無法原子性更新、Schema 版本管理混亂、Partition 規則無法修改、並發讀寫衝突等。
+**做什麼**：bronze / silver 兩層表，檔案存在 MinIO。
 
-### 核心原理
-
-Iceberg 不是一個資料庫，而是**一種定義如何管理資料集合的開放規範（Table Format Specification）**。
+**核心原理 —— 為什麼不是「一堆 Parquet 檔案」**：
 
 ```
-Iceberg Table Architecture
-
-Catalog（元數據入口）
-    └── Table Metadata (JSON)
-           ├── Current Schema
-           ├── Partition Spec
-           ├── Snapshot List
-           └── Current Snapshot
-                    └── Manifest List
-                           ├── Manifest File A
-                           │    ├── data/part-0001.parquet
-                           │    └── data/part-0002.parquet
-                           └── Manifest File B
-                                ├── data/part-0003.parquet
-                                └── data/part-0004.parquet
+catalog             metadata.json         manifest list → manifest → data files
+「表在哪」    →    「表長什麼樣、        「這個快照包含哪些檔案」
+                    有哪些快照」
 ```
 
-**ACID 的實現方式**：  
-Iceberg 使用**樂觀並發控制（Optimistic Concurrency Control）**：
-- 每次寫入都建立新的 Snapshot（快照），不覆蓋舊資料
-- 提交時用 Compare-And-Swap 確保原子性
-- 讀取永遠看到一個一致的快照版本，不會讀到「寫到一半」的資料
+多這幾層換到三件事：
 
-**Time Travel 的實現**：  
-因為每個 Snapshot 都完整保存，查詢時只需指定要讀取哪個 Snapshot 的 Manifest，即可「穿越時間」：
+**① 原子性 commit。** 寫入不是「把檔案放進目錄」，是「產生新的 metadata.json
+並用 CAS 更新 catalog 的指標」。要嘛全部可見，要嘛完全不可見——
+**沒有「讀到寫到一半」的狀態**。
+
+**② 時間旅行與快照隔離。** 每次 commit 產生一個 snapshot。
+讀取時鎖定一個 snapshot，即使同時有人在寫也不受影響。
+
+**③ schema 演進不用重寫資料。** 欄位有獨立 ID，改名/增刪只動 metadata。
+
+**vs Delta Lake / Hudi**：三者解決同一類問題。選 Iceberg 是因為它
+**引擎中立**——Flink 寫、Trino 讀、未來 Spark 也能讀，沒有綁定。
+Delta 早期跟 Databricks 綁得比較緊（現在開放很多），Hudi 偏向 upsert 場景。
+
+**實際踩到的 —— 這個專案最貴的一課**：
+
+**catalog 和資料是兩層，而 catalog 也需要持久化。**
+`tabulario/iceberg-rest` 沒設 `CATALOG_URI` 時，預設是記憶體裡的 SQLite。
+pod 一重啟，「有哪些表」全部歸零——Parquet 檔全都變成孤兒。
+
+```
+Trino: Schema 'bronze' does not exist      ← catalog 沒了
+MinIO: 18M /data/warehouse/bronze          ← 資料還在
+```
+
+> **書還在書架上，被燒掉的是索引卡。**
+
+而換成檔案型 SQLite 之後又炸了第二次：**SQLite 是單寫者模型**，
+兩個 Flink job 同時 commit 就有一個直接失敗（`SQLITE_BUSY`），
+被包成 HTTP 500，Flink 收到 `CommitStateUnknownException` 進入無法自癒的重啟迴圈。
+
+最終方案是 Postgres。完整經過見
+[`doc/knowledge/iceberg-catalog.md`](knowledge/iceberg-catalog.md)。
+
+**雲端對應**：AWS Glue Data Catalog + S3、GCP BigLake Metastore + GCS、
+Snowflake / Databricks 的 Iceberg 支援、Tabular（已被 Databricks 收購）。
+
+## MinIO
+
+**做什麼**：S3 相容的物件儲存。放 Iceberg 的 Parquet、Flink 的 checkpoint 與 HA 狀態。
+
+**為什麼**：本機開發要一個 S3。MinIO 的 API 相容度高到
+**程式碼完全不用改就能換成真的 S3/GCS**——只換 endpoint 和憑證。
+
+**取捨**：在 K8s 上自架物件儲存本身就是一件要維運的事（PVC、備份、擴容）。
+生產環境沒有理由不用託管的 GCS/S3。這裡用它是為了「整套能在本機跑」。
+
+**實際踩到的**：`s3.path-style-access: true` 必設。
+MinIO 只支援 `endpoint/bucket/key`，不支援 AWS 的 `bucket.endpoint/key`。
+
+**雲端對應**：直接換成 GCS（本專案的下一步）、S3、Azure Blob。
+
+## PostgreSQL
+
+**做什麼**：**只當 Iceberg catalog 的後端**，不存業務資料。
+
+裡面只有兩張表：
+
 ```sql
-SELECT * FROM iceberg.silver.vwap_1min
-FOR TIMESTAMP AS OF TIMESTAMP '2026-05-08 09:30:00';
+iceberg_tables                    -- namespace / table / metadata_location
+iceberg_namespace_properties
 ```
 
-**Schema Evolution（無需重寫資料）**：
-- 新增欄位：舊檔案讀取時，新欄位自動填 NULL
-- 刪除欄位：舊檔案中的欄位被忽略
-- 重命名欄位：透過欄位 ID（而非名稱）追蹤，重命名後舊檔案仍可正確讀取
+**為什麼需要它**：見上面 Iceberg 那段。簡短版：catalog 要支援
+**並行寫入**和**CAS**，SQLite 兩者都不行。
 
-### 優勢
+**實際踩到的**：`PGDATA` 必須指向子目錄。GKE 掛載 ext4 的 PVC 時
+根目錄會有 `lost+found`，而 `initdb` 堅持要一個完全空的目錄：
 
-- **ACID 事務**：支援原子性的 INSERT/UPDATE/DELETE，確保資料一致性
-- **Time Travel**：可查詢任意歷史時間點，支援資料審計與回滾
-- **Schema Evolution**：欄位增刪改不需重寫資料，Flink Job 不需重啟
-- **Partition Evolution**：分區策略可以在線修改（從按月改為按天），舊資料仍可查詢
-- **Multi-Engine 支援**：Flink、Spark、Trino、Hive 等均可讀寫同一張 Iceberg 表
+```
+initdb: error: directory "/var/lib/postgresql/data" exists but is not empty
+```
 
-### 雲端對應服務
-
-| 雲端 | Iceberg 整合方式 | Catalog 服務 | 說明 |
-|---|---|---|---|
-| **AWS** | S3 儲存 + AWS Glue Catalog | **AWS Glue Data Catalog**（Iceberg REST 端點） | Glue 5.0 支援 Iceberg 1.6.1；也可用 Amazon S3 Tables（2024 新服務，內建 Iceberg） |
-| **GCP** | GCS 儲存 + BigLake Managed Tables | **BigLake / BigQuery Iceberg** | GCP 透過 BigLake Managed Tables 支援 Iceberg；BigQuery 可直接查詢 Iceberg 外部表 |
-| **Azure** | ADLS Gen2 儲存 + Polaris Catalog | **Azure Fabric OneLake + Polaris** | Microsoft Fabric 透過 OneLake 支援 Iceberg；可搭配 Polaris（Snowflake 開源的 Iceberg Catalog） |
+**雲端對應**：Cloud SQL、RDS、Aurora。catalog 的寫入量極小
+（每次 checkpoint 更新幾列），最小規格就夠。
 
 ---
 
-## 5. MinIO
+# 五、查詢
 
-### 背景
+## Trino
 
-MinIO 創立於 2014 年，是一個高性能的開源物件儲存系統，完全相容 AWS S3 API。  
-設計目標是成為「私有雲 / 本地環境的 S3」，讓企業在自有硬體上實現雲端等級的物件儲存能力。
+**做什麼**：查 Iceberg 表。gateway 的 `/api/klines` 和 `/api/symbols` 都走它。
 
-### 核心原理
+**核心原理**：MPP（大規模平行處理）查詢引擎，**只做運算不存資料**。
+它透過 connector 讀外部資料源，把查詢切成 stage 分散執行，全程在記憶體裡。
 
-MinIO 採用 **Erasure Coding（糾刪碼）** 而非傳統的 3 副本複製：
-- 將一個物件拆分成 K 個資料片段 + M 個校驗片段
-- 任意 M 個片段損壞都可以重建完整物件
-- 相較於 3 副本，空間效率提升 50% 以上
+**vs Spark SQL**：Trino 為**互動式查詢**設計（秒級回應），
+Spark 為**批次 ETL** 設計（容錯、可跑幾小時）。
+Trino 的一個 stage 掛掉整個查詢就失敗——它賭的是「查詢夠短，重跑成本低」。
 
-在本 POC 中，MinIO 扮演 **S3 的本地替代品**，是 Iceberg Parquet 檔案的實際儲存後端。
+**為什麼這個專案用它**：K 線圖要「使用者一點就出來」。
+Spark 起一個 job 的時間就超過使用者的耐心了。
 
-### 雲端對應服務
+**實際踩到的**：
 
-| 雲端 | 對應服務 | 說明 |
-|---|---|---|
-| **AWS** | **Amazon S3** | 業界標準物件儲存，MinIO 完全相容其 API，生產環境直接替換 |
-| **GCP** | **Google Cloud Storage (GCS)** | 需調整 Flink/Spark 的 `fs.defaultFS` 配置 |
-| **Azure** | **Azure Data Lake Storage Gen2 (ADLS)** | 支援 Hierarchical Namespace，適合大規模分析工作負載 |
+Trino 476 的 Iceberg connector 設定是 `fs.native-s3.enabled=true`，
+**不是** `fs.s3.enabled`。網路上的答案版本差異很大，最後是去翻對應版本的文件才確定。
 
----
+**原本規劃「按需啟動」以省 1 vCPU，後來推翻**——因為 Web 前端本來就依賴它。
+`replicas: 0` 的話圖表直接壞掉。這是設計上的矛盾，
+在「Trino 只是分析工具」的假設下才成立，而那個假設在加了 Web 之後就不成立了。
 
-## 6. Apache Airflow
-
-### 背景
-
-Airflow 由 Airbnb 工程師 Maxime Beauchemin 於 2014 年創建，2016 年加入 Apache 孵化器，  
-2019 年成為 Apache 頂級專案。Airflow 的核心理念是「**Configuration as Code**」——用 Python 程式碼定義工作流程（DAG）。
-
-### 核心原理
-
-Airflow 圍繞 **DAG（Directed Acyclic Graph，有向無環圖）** 組織工作流程：
-
-```
-DAG: nasdaq_iceberg_maintenance
-│
-├── compact_bronze_trades
-│       │
-│       ▼
-├── merge_silver_daily_ohlcv
-│       │
-│       ▼
-├── build_gold_top_movers
-│       │
-│       ▼
-└── expire_old_snapshots
-```
-
-**核心元件**：
-- **Scheduler**：解析 DAG 定義，按排程觸發 Task 執行
-- **Executor**：決定 Task 在哪裡執行（本地、Celery 分散式、Kubernetes 上的 Pod）
-- **Metadata DB**：儲存 DAG 定義、Task 執行歷史、狀態
-- **Webserver**：提供 UI 介面，查看 DAG 執行狀態、Log、觸發手動執行
-
-**在本 POC 中的角色**：  
-Airflow 不參與 Streaming 的即時處理，而是負責「Streaming 的維護工作」——  
-每小時執行 Iceberg Compaction、Bronze → Silver MERGE、清理過期 Snapshots。  
-這是「Streaming + Batch Hybrid」架構中 Airflow 的典型角色。
-
-### 優勢
-
-- **Python 原生**：DAG 用 Python 撰寫，可利用所有 Python 生態系（判斷式、迴圈、動態生成 Task）
-- **豐富的 Operator**：內建 200+ Operator，支援 Spark、Flink、Kubernetes、SQL、S3 等
-- **可視化監控**：DAG 執行圖、每個 Task 的執行時間、成功/失敗歷史一目了然
-- **Backfill**：可以重新執行歷史日期的 DAG，彌補遺漏的執行
-
-### 雲端對應服務
-
-| 雲端 | 服務 | 說明 |
-|---|---|---|
-| **AWS** | **Amazon MWAA**（Managed Workflows for Apache Airflow） | 完全託管的 Airflow，與 S3/Glue/EMR/Redshift 深度整合 |
-| **GCP** | **Cloud Composer** | 基於 GKE 的託管 Airflow，與 BigQuery/GCS/Dataflow 深度整合 |
-| **Azure** | **Azure Data Factory + Airflow Integration Runtime** | ADF 原生支援 Airflow DAG 執行；也可用 AKS 自託管 |
-| **SaaS** | **Astronomer** | 商業版 Airflow SaaS，三雲均支援，企業級功能 |
+**雲端對應**：AWS Athena（就是託管的 Trino/Presto）、
+GCP BigQuery（架構不同但定位相同）、Starburst（Trino 的商業版）。
 
 ---
 
-## 7. Trino
+# 六、應用層
 
-### 背景
+## FastAPI + SSE
 
-Trino（前身 PrestoSQL）源自 Facebook 於 2012 年開發的 Presto 分散式 SQL 引擎。  
-2019 年原始開發者 Martin Traverso 等人離開 Facebook，以 Trino 名稱繼續開發開源版本。  
-Trino 的設計目標是「**聯邦查詢（Federated Query）**」——用單一 SQL 查詢跨越多個異質資料來源（S3、RDBMS、Iceberg、Hive 等）。
-
-### 核心原理
+**做什麼**：gateway。兩種資料路徑：
 
 ```
-Client SQL
-    │
-    ▼
-Trino Coordinator（查詢計畫、優化、排程）
-    │
-    ├── Worker 1 → 讀取 Iceberg Parquet on MinIO（Partition 0, 1）
-    ├── Worker 2 → 讀取 Iceberg Parquet on MinIO（Partition 2, 3）
-    └── Worker 3 → 讀取 Iceberg Parquet on MinIO（Partition 4, 5）
-    │
-    ▼
-聚合結果 → 返回 Client
+即時：Kafka consumer → 記憶體 → SSE 推給瀏覽器
+歷史：Trino 查詢 → JSON
 ```
 
-Trino 不儲存任何資料，完全是「查詢層」。它透過 **Connector** 機制支援不同資料來源，  
-Iceberg Connector 直接讀取 Parquet 檔案並下推 Filter（Predicate Pushdown），避免全表掃描。
+**為什麼是 SSE 不是 WebSocket**：行情圖表是**單向**的——伺服器推、瀏覽器收，
+沒有反向通訊需求。SSE 是純 HTTP，自動重連內建，
+**經過 nginx / 負載平衡器的行為比 WebSocket 單純**（不需要 upgrade 協商）。
 
-### 優勢
+WebSocket 的優勢在雙向互動（聊天、協作），這裡用不到。
 
-- **No-ETL 查詢**：直接查詢 Iceberg Parquet，不需先把資料載入資料庫
-- **多源聯邦查詢**：一個 SQL 可以 JOIN Iceberg 表和 PostgreSQL 表
-- **標準 SQL**：完整支援 ANSI SQL，Superset / BI 工具可直接連接
-- **Iceberg 原生支援**：支援 Time Travel、Schema Evolution 查詢
+**實際踩到的**：gateway 只能 `replicas: 1`。它在記憶體裡維護
+`_alert_history` / `_price_history` / `_quotes`，新連上的 client 會先收到這份快照。
+多副本的話每個副本各自累積不同的歷史，使用者重新整理可能連到另一個副本、
+**看到不一樣的資料**。要多副本得先把狀態外推（例如 Redis），那是另一個工程。
 
-### 雲端對應服務
+nginx 的反向代理也有坑：
 
-| 雲端 | 服務 | 說明 |
-|---|---|---|
-| **AWS** | **Amazon Athena** | Serverless SQL，直接查詢 S3 上的 Parquet/Iceberg，按掃描量計費 |
-| **GCP** | **BigQuery** | Serverless 資料倉儲，原生支援讀取 GCS 上的 Iceberg 表（BigLake External Tables） |
-| **Azure** | **Azure Synapse Analytics** | 支援 Synapse Serverless SQL Pool 直接查詢 ADLS 上的 Parquet/Delta/Iceberg |
-
----
-
-## 8. Apache Superset
-
-### 背景
-
-Superset 由 Airbnb 工程師 Maxime Beauchemin（同時也是 Airflow 作者）於 2015 年創建，  
-2017 年捐贈給 Apache 基金會，2021 年成為頂級專案。  
-設計目標是提供一個輕量、易用、可嵌入的開源 BI 工具。
-
-### 核心原理
-
-Superset 是一個純 Query Layer 的 BI 工具，本身**不儲存任何業務資料**：
-- 透過 SQLAlchemy 連接資料庫（Trino、PostgreSQL、BigQuery、Redshift 等）
-- 在 Superset 的 Metadata DB 中儲存 Dashboard 定義、Chart 配置
-- 每次瀏覽 Dashboard 時，動態向後端資料庫發送 SQL 查詢
-
-本 POC 中：Superset → Trino → Iceberg Parquet on MinIO
-
-### 雲端對應服務
-
-| 雲端 | 服務 | 說明 |
-|---|---|---|
-| **AWS** | Amazon QuickSight | 原生 SaaS BI，可連接 Athena/Redshift/S3 |
-| **GCP** | Looker / Looker Studio | Looker 是企業版，Looker Studio 免費，可連接 BigQuery |
-| **Azure** | Power BI | Microsoft 生態系標準 BI，深度整合 Azure Synapse / ADLS |
-| **Multi-Cloud** | Grafana（資料面板）/ Metabase（輕量 BI） | 開源替代方案 |
-
----
-
-## 9. Prometheus + Grafana
-
-### Prometheus 背景與原理
-
-Prometheus 由 SoundCloud 於 2012 年開發，2016 年成為 CNCF 第二個畢業專案（僅次於 Kubernetes）。  
-採用**Pull 模型**：Prometheus 主動定期抓取（Scrape）各服務暴露的 `/metrics` HTTP 端點，  
-而非由各服務主動推送。這讓 Prometheus 天然支援服務探索和動態擴縮。
-
-資料以**時間序列（Time Series）**格式儲存，每條時間序列由指標名稱和 Label 組合唯一標識：
-```
-kafka_consumer_group_lag{topic="nasdaq-trades", partition="3", group="flink-consumer"} 42
-                         ↑──────── Labels ────────────────────────────────────────── ↑ Value
-```
-
-### Grafana 背景與原理
-
-Grafana 於 2014 年由 Torkel Ödegaard 開發，是最廣泛使用的指標視覺化工具。  
-Grafana 本身只是「視覺化層」，它連接各種資料來源（Prometheus、InfluxDB、Loki、Tempo 等），  
-將時間序列資料渲染為折線圖、熱力圖、Gauge 等視覺化元素。
-
-### 雲端對應服務
-
-| 雲端 | 服務 | 說明 |
-|---|---|---|
-| **AWS** | Amazon CloudWatch | 完全託管的監控服務，原生整合所有 AWS 服務；可透過 Container Insights 監控 EKS |
-| **GCP** | Google Cloud Monitoring（Stackdriver） | 支援 Prometheus 格式指標，可用 Grafana 連接 |
-| **Azure** | Azure Monitor + Azure Managed Grafana | 2022 年推出 Azure Managed Grafana，完全託管，整合 Azure Monitor |
-| **SaaS** | Grafana Cloud | 商業版 Grafana，免費 Tier 可用，整合 Prometheus/Loki/Tempo |
-
----
-
-## 10. OpenLineage + Marquez
-
-### 背景
-
-OpenLineage 於 2021 年由 Astronomer 公司發起，目標是為資料工程建立一個**開放的資料血緣標準（Open Standard for Data Lineage）**。  
-類似 Kafka 之於訊息串流，OpenLineage 定義了一套統一的事件格式，讓 Flink / Spark / Airflow / dbt 等不同工具都能用同一語言「說清楚」資料的來龍去脈。
-
-Marquez 是 OpenLineage 的參考實作（Reference Implementation），提供收集、儲存、查詢、視覺化血緣資料的完整後端。
-
-### 核心概念
-
-```
-OpenLineage Event 的基本結構：
-
-{
-  "eventType": "COMPLETE",
-  "job": {
-    "namespace": "nasdaq-poc",
-    "name": "nasdaq_vwap_calculator"    ← 哪個 Job
-  },
-  "inputs": [{
-    "namespace": "kafka",
-    "name": "nasdaq-trades"             ← 讀取哪些資料
-  }],
-  "outputs": [{
-    "namespace": "iceberg",
-    "name": "silver.vwap_1min"          ← 寫入哪些資料
-  }],
-  "run": {
-    "runId": "uuid",
-    "facets": { "processing_engine": {...} }
-  }
+```nginx
+location /api/stream {
+    proxy_pass http://gateway.streaming.svc.cluster.local:8000;  # 不能有結尾斜線
+    proxy_buffering off;      # ← 沒這行，SSE 會被 nginx 緩衝住
+    proxy_read_timeout 24h;   # ← 沒這行，長連線會被切斷
 }
 ```
 
-### 重要性（Senior DE 的視角）
+## React + lightweight-charts + Vite
 
-資料血緣讓你能回答兩個關鍵問題：
-1. **上游影響分析（Impact Analysis）**：「Kafka Topic `nasdaq-trades` 壞了，哪些下游 Dashboard 會受影響？」
-2. **下游追蹤（Data Tracing）**：「Silver VWAP 表的數值異常，是哪個 Flink Job / Kafka Topic 造成的？」
+**做什麼**：K 線圖前端。`lightweight-charts` 是 TradingView 開源的圖表庫，
+專為金融圖表設計（K 棒、成交量、十字準星），體積比 ECharts / Chart.js 小很多。
 
-### 雲端對應服務
+**實際踩到的**：compose 版本是開發模式（`npm run dev`），
+搬上 K8s 時**改寫成兩階段 build**：
 
-| 雲端 | 服務 | 說明 |
-|---|---|---|
-| **AWS** | **Amazon DataZone** | 含資料血緣、資料目錄、治理功能的整合平台 |
-| **GCP** | **Google Dataplex + Data Catalog** | 自動抓取 BigQuery/GCS 的資料血緣，可視化展示 |
-| **Azure** | **Microsoft Purview** | 企業級資料治理平台，支援跨雲自動血緣爬取 |
+```dockerfile
+FROM node:22-alpine AS build
+RUN npm ci && npm run build      # 產出靜態檔
+FROM nginx:1.27-alpine           # 只帶靜態檔，image 約 50MB
+```
+
+不該在容器啟動時 `npm install`——慢、不可重現、而且要對外網路。
+**這是「compose 的開發模式不能直接搬」的典型例子。**
+
+nginx 監聽 8080 而不是 80，因為以非 root 執行時綁不了特權埠。
+
+## discord.py
+
+**做什麼**：bot 消費 `market-price-alerts`，推播到 Discord 頻道。
+
+**為什麼 `replicas: 1` 且 `strategy: Recreate`**：兩個副本會讓同一則告警送兩次
+——它們不是分工消費，是各自讀全部的告警。滾動更新期間新舊並存也一樣，
+所以用 `Recreate`。
+
+**實際踩到的**：bot 目前**沒有任何健康端點**。
+原本有一個 `pgrep -f 'bot.main'` 的 liveness probe，兩個問題：
+
+1. `python:3.12-slim` 不含 procps，根本沒有 `pgrep` → probe 永遠失敗 → 殺了 26 次
+2. 更根本的是：`CMD` 用 exec form，python 就是 PID 1，
+   **PID 1 死掉容器本來就會結束**，這個 probe 在設計上不可能提供資訊
+
+已整段移除。**「聊勝於無」在監控上是錯的判斷**——
+弱訊號的 probe 沒有上行空間，只有下行風險。
 
 ---
 
-## 11. Flink Kubernetes Operator
+# 七、平台
 
-### 背景
+## Kubernetes / GKE
 
-Flink Kubernetes Operator 是 Apache Flink 社群於 2022 年推出的官方 K8s 擴展，  
-2023 年達到 Production Ready 狀態。它讓工程師用 **Kubernetes CRD（Custom Resource Definition）**  
-以宣告式方式管理 Flink Job 的完整生命週期，而不需寫複雜的 Shell Script。
+**做什麼**：跑上面所有東西。GKE Standard、3 × e2-standard-4 Spot、
+手寫 raw YAML（不用 Helm）。
 
-### 核心能力
+**核心原理 —— 一句話**：
+**K8s 沒有「執行」你的 YAML，它只是把 YAML 存進 etcd**，
+然後各種 controller 不斷把「實際狀態」拉向「宣告的狀態」。
 
-| 功能 | 說明 |
+理解這件事之後很多行為就順了：`apply` 很快回來不代表做完了；
+刪掉 pod 它會長回來；`kubectl get` 是在讀 etcd。
+
+**為什麼這個專案要上 K8s**：不是為了「雲原生」這個詞。
+具體換到三件 compose 給不了的：
+
+1. **自癒**：Spot node 被回收，pod 自動在別台重建
+2. **宣告式的資源管理**：requests/limits、PDB、topologySpread
+3. **真正的多副本與滾動更新**
+
+代價是**一整層新的失敗模式**：RBAC、uid/fsGroup、Job 不可變、
+ConfigMap 掛載會蓋掉整個目錄……這個專案四週踩的坑幾乎都在這一層。
+
+**為什麼不用 Helm**：專案的目的是學會原生物件怎麼串。
+先用 chart 就跳過了那一段。**Kafka 是第一個「值得重新考慮要不要用 Operator」
+的地方**（Strimzi），但那也意味著跳過 StatefulSet / advertised listener 這些。
+
+詳見 [`doc/knowledge/k8s-objects.md`](knowledge/k8s-objects.md)。
+
+## Spot VM
+
+**做什麼**：三台 node 全部是 Spot，價格約隨需的三分之一。
+
+**代價**：GCP 可以隨時回收，只給 30 秒通知。所以整套系統的設計前提是
+**「任何一個 pod 隨時可能消失」**——這反而逼出了正確的架構：
+
+- Flink 的狀態在 S3 不在本地磁碟
+- TaskManager 是無狀態 Deployment
+- Kafka 用 StatefulSet + PDB + topologySpread
+
+**實際踩到的**：`ZONE_RESOURCE_POOL_EXHAUSTED`——Spot 容量不足時
+叢集會建起來但一台 node 都沒有。而且 `gcloud container clusters list-errors`
+顯示的是**歷史**錯誤，當前狀態要看 `instances list` 和 MIG 的 `IS_STABLE`。
+
+## Artifact Registry
+
+**做什麼**：存五個自建 image（producer / flink / gateway / web / bot）。
+
+**實際踩到的兩件事**：
+
+**`roles/container.defaultNodeServiceAccount` 不包含 `artifactregistry.reader`。**
+GKE 的提示訊息會叫你授予前者，但那不夠——症狀是 ImagePullBackOff 403。
+
+**arm64 Mac 要指定平台**：
+
+```bash
+docker buildx build --platform linux/amd64 ...
+```
+
+不指定的話 build 出來的是 arm64 image，在 e2 node 上跑不起來，
+而錯誤訊息（`exec format error`）跟平台完全沒關係。
+
+---
+
+# 八、監控
+
+## Prometheus
+
+**做什麼**：抓 8 個 target 的指標，評估 4 條 SLO 規則。
+
+**核心原理 —— pull 而不是 push**：Prometheus 主動去抓，
+而不是等服務推過來。好處是「目標活著嗎」本身就是一個免費的指標
+（抓不到 = down），而且不用擔心被大量 push 打爆。
+
+**這個專案最大的轉換**：`static_configs` → `kubernetes_sd_configs`。
+
+```
+compose：Prometheus 這一側列舉所有位址
+K8s：   各服務用 pod annotation 宣告「我要被抓」
+```
+
+結果是整份 `prometheus.yml` 裡**沒有任何位址**。
+TaskManager 從 2 個擴到 4 個會自動納入。
+
+詳見 [`doc/knowledge/observability.md`](knowledge/observability.md)。
+
+**雲端對應**：Google Managed Service for Prometheus、
+Amazon Managed Prometheus、Datadog / New Relic（商業，模型不同）。
+
+## Alertmanager
+
+**做什麼**：收 Prometheus 推來的告警，分組、去重、送到 Discord。
+
+**分工要分清楚**：Prometheus 決定「什麼時候該告警」，
+Alertmanager 決定「怎麼通知」。所以規則寫在 Prometheus，收件人寫在這裡。
+
+**實際踩到的**：**Alertmanager 不展開環境變數。**
+寫 `${DISCORD_WEBHOOK}` 只會被當字面字串送出去，Discord 回 404，
+而日誌只說「通知失敗」。解法是 `webhook_url_file` 指向掛載的 Secret 檔案。
+
+## Grafana
+
+**做什麼**：四個 panel——consumer lag、checkpoint duration/size、
+watermark lag、records/s。
+
+**provisioning 而不是手動建**：設定進 git，不會發生
+「看板只存在某人瀏覽器裡點出來的狀態」。代價是 UI 上改了不會存回檔案，
+重啟就還原——要改就改 YAML 再 apply。
+
+**實際踩到的**：資料來源的 `uid` 要固定（我們寫死 `PROM`）。
+讓 Grafana 自動產生的話每次重建都不同，看板會找不到資料來源，
+每個 panel 顯示 `Datasource PROM was not found`。
+
+---
+
+# 沒有用到的技術，以及為什麼
+
+舊版文件涵蓋了幾項最後沒用上的東西，一併記錄理由：
+
+| 技術 | 為什麼沒用 |
 |---|---|
-| **宣告式部署** | 用 YAML 定義 Flink Job，Operator 負責實現（類似 Deployment 管理 Pod）|
-| **自動重啟** | Job 崩潰時，Operator 從最新 Checkpoint 自動恢復，無需人工介入 |
-| **零停機升級** | `upgradeMode: savepoint` — 升級前自動建立 Savepoint，升級後從 Savepoint 恢復，資料零遺失 |
-| **Savepoint 管理** | 可排程定期觸發 Savepoint（如每 6 小時），作為長期備份 |
-| **Job 暫停/恢復** | 用 `spec.job.state: suspended` 暫停 Job（釋放資源），再恢復時從最新 Savepoint 繼續 |
+| **ZooKeeper** | Kafka 3.3+ 的 KRaft 已生產可用。少養一個叢集 |
+| **Apache Airflow** | 這是**串流**專案，沒有需要排程的批次 DAG。Iceberg 表維護（compaction / expire snapshot）未來可能需要，但一個 CronJob 就夠 |
+| **Apache Superset** | 前端是自己寫的 K 線圖，不需要通用 BI。Grafana 已覆蓋監控面板 |
+| **OpenLineage + Marquez** | 資料血緣在只有 bronze/silver 兩層、四個 job 的規模下，價值低於維運成本 |
+| **Flink Kubernetes Operator** | 用 CRD 提交 job 更接近生產做法，但會跳過 JM/TM 部署、HA 設定、RBAC——而那正是本專案要學的 |
+| **Strimzi（Kafka Operator）** | 同上。手寫 StatefulSet 才會遇到 advertised listener 這一關 |
+| **Helm** | 同上。先用 chart 就跳過了原生物件怎麼串 |
+| **NetworkPolicy** | 應該要有，只是還沒做。目前 namespace 內誰都連得到誰 |
+| **Secret Manager** | 憑證仍在 K8s Secret（etcd 裡只是 base64）。已列為待辦 |
 
-### 雲端對應服務
-
-| 雲端 | 方式 | 說明 |
-|---|---|---|
-| **AWS** | Amazon EKS + Flink K8s Operator | 在 EKS 上安裝 Operator，State 存 S3；或使用 Amazon Managed Service for Apache Flink（全托管）|
-| **GCP** | Google GKE + Flink K8s Operator | 在 GKE 上安裝 Operator，State 存 GCS |
-| **Azure** | Azure AKS + Flink K8s Operator | 在 AKS 上安裝 Operator，State 存 ADLS |
+前六項是**刻意的取捨**——它們都會讓系統更好，但會讓學習少一層。
+後兩項是**還沒做**，不是不該做。
 
 ---
 
-## 12. Alpaca Markets WebSocket
+# 雲端對應總表
 
-### 背景
-
-Alpaca 是一家成立於 2015 年的 FinTech 公司，提供針對程式化交易的 API-First 券商服務。  
-2019 年推出零手續費股票交易 API，快速成為 Algo Trading 社群最受歡迎的資料來源之一。  
-Alpaca 的市場資料 API 基於 **WebSocket** 協議，支援即時 Trades、Quotes、Bars 串流。
-
-### 免費方案限制
-
-| 項目 | Free（IEX）| 說明 |
-|---|---|---|
-| 資料來源 | IEX Exchange | IEX 約佔全美股市成交量的幾個百分點，非全市場代表 |
-| WebSocket 訂閱 | 最多 30 個 symbols | 超過需升級付費方案 |
-| 歷史資料 | 2016 年至今，15 分鐘延遲 | 即時 WebSocket 無延遲，但 REST API 歷史查詢有延遲 |
-
-### 資料類型
-
-| Stream | 說明 | 典型頻率（熱門股開盤時）|
-|---|---|---|
-| `subscribe_trades` | 每筆實際成交（price, size, exchange, tape）| 每秒 1～10 筆 |
-| `subscribe_quotes` | 即時最優 bid/ask（NBBO）更新 | 每秒 10～50 筆 |
-| `subscribe_bars` | 1 分鐘 OHLCV 已聚合棒 | 每分鐘 1 筆 |
-
-### 升級路徑（當需要更大流量時）
-
-| 方案 | 費用 | 資料來源 | 訂閱數 |
+| 本專案 | AWS | GCP | Azure |
 |---|---|---|---|
-| Free | $0 | IEX | 30 symbols |
-| Algo Trader Plus | $99/月 | SIP（全市場）| 無限制 |
-| 更高流量需求 | - | Polygon.io / Databento | - |
+| Kafka (KRaft) | MSK | Managed Service for Kafka | Event Hubs (Kafka API) |
+| Schema Registry | Glue Schema Registry | —（用 Confluent Cloud） | Schema Registry (Event Hubs) |
+| Flink | Managed Service for Apache Flink | Dataflow (Beam) | HDInsight |
+| Iceberg catalog | Glue Data Catalog | BigLake Metastore | Purview |
+| MinIO | S3 | GCS | Blob Storage |
+| Postgres | RDS / Aurora | Cloud SQL | Database for PostgreSQL |
+| Trino | Athena | BigQuery（架構不同） | Synapse |
+| Kubernetes | EKS | **GKE**（本專案） | AKS |
+| Prometheus | Amazon Managed Prometheus | Managed Service for Prometheus | Azure Monitor |
+| Grafana | Amazon Managed Grafana | —（自架） | Azure Managed Grafana |
 
----
-
-## 技術選型對照總表（本地 POC vs 雲端生產）
-
-| 層級 | 本地 POC 技術 | AWS | GCP | Azure |
-|---|---|---|---|---|
-| **分散式協調** | Apache ZooKeeper | 內建於 MSK（不需管理）| 不需要 | 不需要 |
-| **訊息佇列** | Apache Kafka | Amazon MSK | Cloud Pub/Sub | Azure Event Hubs |
-| **Schema 管控** | Confluent Schema Registry | AWS Glue Schema Registry | Confluent Cloud SR | Azure Schema Registry |
-| **串流處理** | Apache Flink 2.0 | Amazon Managed Flink | Cloud Dataflow / Confluent Flink | HDInsight Flink / Confluent Flink |
-| **表格格式** | Apache Iceberg | S3 + AWS Glue Catalog | GCS + BigLake | ADLS + Polaris |
-| **物件儲存** | MinIO | Amazon S3 | Google Cloud Storage | Azure Data Lake Storage Gen2 |
-| **Batch 協調** | Apache Airflow | Amazon MWAA | Cloud Composer | Azure Data Factory + Airflow |
-| **SQL 查詢引擎** | Trino | Amazon Athena | BigQuery | Azure Synapse Serverless |
-| **BI 視覺化** | Apache Superset | Amazon QuickSight | Looker / Looker Studio | Power BI |
-| **指標監控** | Prometheus + Grafana | CloudWatch + Managed Grafana | Cloud Monitoring + Grafana | Azure Monitor + Azure Managed Grafana |
-| **資料血緣** | OpenLineage + Marquez | Amazon DataZone | Google Dataplex | Microsoft Purview |
-| **容器編排** | Kubernetes + Flink Operator | Amazon EKS | Google GKE | Azure AKS |
-
----
-
-*文件整理：NASDAQ Streaming POC 技術深度手冊 | 2026-05*
+**托管服務省掉的是「維運」，不是「設計」。**
+partition 怎麼切、watermark 怎麼設、catalog 放哪、告警閾值多少——
+這些換到雲上還是你的責任，而它們才是這個專案真正在練的東西。

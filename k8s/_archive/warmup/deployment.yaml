@@ -1,0 +1,127 @@
+# ---------------------------------------------------------------------------
+# 暖身 #2：Deployment —— 無狀態服務。
+#
+# 刻意選 nginx + ConfigMap，不用自己的 image：
+# 這一步要練的是 K8s 基本盤，不是 Artifact Registry / image build。
+# 那些留到 Week 8 推 gateway / producer 的時候一起處理。
+#
+# 對照 docker-compose.yml 的差異，每一項都標在下面。
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: warmup
+  namespace: streaming
+  labels:
+    app: warmup
+spec:
+  replicas: 2                    # Compose 沒有這個概念；ReplicaSet 負責維持這個數字
+  revisionHistoryLimit: 3
+
+  selector:                      # ← Deployment 靠這個 label 認養 pod。
+    matchLabels:                 #   必須和 template.metadata.labels 對得上，
+      app: warmup                #   對不上 apply 會直接被 API server 拒絕。
+
+  strategy:
+    type: RollingUpdate          # 滾動更新：先起新的、Ready 了再殺舊的
+    rollingUpdate:
+      maxSurge: 1                # 更新期間最多多開 1 個
+      maxUnavailable: 0          # 且不允許任何一刻少於 replicas —— 零停機
+
+  template:
+    metadata:
+      labels:
+        app: warmup
+    spec:
+      # Spot node 被回收時，讓 pod 盡量散在不同 node 上，不要全滅
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: warmup
+
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - name: http
+              containerPort: 8080
+
+          # --- 設定注入：ConfigMap 的兩種用法 --------------------------
+          envFrom:
+            - configMapRef:
+                name: warmup-config      # 整包變成 env 變數
+                # ⚠️ 這會把 default.conf 那個 key 也變成 env 變數（值是整段設定檔）。
+                #    醜但無害。正式服務應該把「檔案型」和「env 型」拆成兩個 ConfigMap，
+                #    Week 8 就這樣做。
+
+          # --- Secret：用 env 注入，但值不出現在任何 manifest -------------
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: streaming-secrets
+                  key: MINIO_ROOT_USER
+            - name: POD_NAME             # Downward API：pod 自己的 metadata
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+            - name: html
+              mountPath: /usr/share/nginx/html
+
+          # --- 資源：在 GKE 上這兩行直接對應到帳單 ----------------------
+          # requests = 排程器拿來決定「這台 node 塞不塞得下」的數字，
+          #            也是你實際佔用（＝付錢）的量。
+          # limits   = 硬上限。CPU 超過會被 throttle，記憶體超過直接 OOMKilled。
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+
+          # --- Probe：兩種 probe 的差別 --------------------------------
+          # readiness 失敗 → 從 Service endpoints 移除（不再收流量），但 pod 留著
+          # liveness  失敗 → 直接重啟容器
+          # 設錯的經典災難：liveness 打一個會依賴下游的 endpoint，
+          #                 下游一慢就整批重啟，把小問題放大成雪崩。
+          #                 所以 liveness 只該檢查「這個 process 自己還活著嗎」。
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: false          # nginx:alpine 需要 root 綁 port（這裡用 8080 其實可以改）
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "SETUID", "SETGID", "NET_BIND_SERVICE"]
+
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: warmup-config
+            items:
+              - key: default.conf
+                path: default.conf       # 只挑這一個 key 掛成檔案
+        - name: html
+          configMap:
+            name: warmup-html

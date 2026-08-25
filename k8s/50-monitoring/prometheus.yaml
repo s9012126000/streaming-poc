@@ -1,0 +1,316 @@
+# ---------------------------------------------------------------------------
+# Prometheus —— Week 9 的核心轉換：static_configs → kubernetes_sd_configs
+#
+# compose 的做法是把每個目標的位址寫死：
+#     static_configs:
+#       - targets: ["flink-jobmanager:9249"]
+#     dns_sd_configs:                       # TaskManager 有兩個副本
+#       - names: ["flink-taskmanager"]
+#
+# 那在 K8s 上會壞掉兩次：
+#   1. TaskManager 從 2 個變 4 個時，你要回來改設定
+#   2. producer / gateway 這些 Deployment 的 pod IP 每次重建都不同
+#
+# K8s 的做法是反過來的：**Prometheus 去問 API「誰想被抓」**，
+# 而「想被抓」由各服務自己用 pod annotation 宣告：
+#     prometheus.io/scrape: "true"
+#     prometheus.io/port:   "9249"
+#
+# Week 8 部署時就已經在 producer / Flink JM / Flink TM 加好了，
+# 所以這裡不需要列舉任何位址。TaskManager 擴到 4 個會自動納入。
+# ---------------------------------------------------------------------------
+
+# --- TSDB 的磁碟 -----------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data
+  namespace: streaming
+  labels:
+    app: prometheus
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 10Gi
+      # 保留 7 天、抓 15 秒一次、目標約 10 個 pod，
+      # 實際用量遠低於 10Gi。10Gi 是 GCE pd-standard 的最小配置量。
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: streaming
+  labels:
+    app: prometheus
+spec:
+  type: ClusterIP
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+---
+# --- 主設定 ----------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: streaming
+  labels:
+    app: prometheus
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ["alertmanager:9093"]
+      # ↑ 這裡刻意保留 static_configs。
+      #   Alertmanager 只有一個、位址固定，用服務發現是多餘的複雜度。
+      #   「能用服務發現」不等於「什麼都該用服務發現」。
+
+    scrape_configs:
+      # ═══════════════════════════════════════════════════════════
+      # 唯一的 job：把所有帶 annotation 的 pod 抓進來
+      # ═══════════════════════════════════════════════════════════
+      - job_name: kubernetes-pods
+
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [streaming]
+            # ↑ 必須跟 prometheus-rbac.yaml 的 Role 範圍一致。
+            #   不寫的話 Prometheus 會嘗試列出全叢集的 pod，
+            #   而我們只給了 namespace 級的權限 → 403 → /targets 空白。
+
+        relabel_configs:
+          # ── 1. 只保留有宣告 scrape: true 的 pod ──────────────
+          # 沒有這條就會去抓每一個 pod（包括 Kafka、MinIO、
+          # 那些臨時的 gchk-* curl pod），全部失敗、噪音滿天。
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+
+          # ── 2. 跳過非 Running 的 pod ────────────────────────
+          # Completed 的 Job pod（flink-submit）和正在建立的 pod
+          # 抓不到東西，只會讓 /targets 一直有紅色項目。
+          - source_labels: [__meta_kubernetes_pod_phase]
+            action: drop
+            regex: (Pending|Succeeded|Failed|Unknown)
+
+          # ── 3. 套用自訂路徑 ─────────────────────────────────
+          # producer 是 /metrics（預設值），Flink 也是。
+          # 有宣告 prometheus.io/path 的才覆寫。
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+
+          # ── 4. 把 pod IP 和 annotation 指定的 port 組起來 ────
+          # __address__ 預設是 <podIP>:<第一個 containerPort>，
+          # 那不一定是 metrics 的埠（例如 producer 的第一個埠可能是別的）。
+          # 這條把它換成 <podIP>:<prometheus.io/port>。
+          #
+          # regex 的兩段分別對應「IP」和「annotation 的 port」，
+          # 中間的 ; 是 Prometheus 串接多個 source_labels 的分隔符。
+          - source_labels:
+              [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+
+          # ── 5. 補上人看得懂的標籤 ───────────────────────────
+          # 沒有這幾條的話，Grafana 上只看得到 IP，
+          # 沒辦法用 app="producer" 這種方式篩選。
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: replace
+            target_label: app
+          - source_labels: [__meta_kubernetes_pod_label_component]
+            action: replace
+            target_label: component
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            action: replace
+            target_label: node
+---
+# --- 告警規則（原樣搬自 monitoring/rules/pipeline.yml）--------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: streaming
+  labels:
+    app: prometheus
+data:
+  pipeline.yml: |
+    groups:
+      - name: pipeline-slo
+        rules:
+          # SLO 1: Bronze 資料新鮮度
+          # （真正的 max(ingest_ts) 需要 Trino 端 probe，
+          #   PoC 用「來源沒在動」代替，見 week4 doc）
+          - alert: BronzeStalled
+            expr: sum(rate(flink_taskmanager_job_task_operator_numRecordsOutPerSecond[1m])) == 0
+            for: 5m
+            labels: { severity: page }
+            annotations:
+              summary: "Bronze source 5 分鐘沒有輸出任何 record — producer 掛了或 pipeline 卡住"
+
+          # SLO 2: consumer 不積壓（需要 kafka-exporter）
+          - alert: ConsumerLagGrowing
+            expr: sum(kafka_consumergroup_lag{consumergroup="flink-bronze-consumer"}) > 100000
+            for: 10m
+            labels: { severity: warn }
+            annotations:
+              summary: "flink-bronze-consumer lag 持續高於 10 萬超過 10 分鐘"
+
+          # SLO 3: checkpoint 健康
+          - alert: CheckpointUnhealthy
+            expr: increase(flink_jobmanager_job_numberOfFailedCheckpoints[10m]) >= 3
+            for: 0m
+            labels: { severity: page }
+            annotations:
+              summary: "10 分鐘內 checkpoint 失敗 >= 3 次"
+
+          # DLQ 深度：正常應為 0（需要 kafka-exporter）
+          - alert: DLQNotEmpty
+            expr: >
+              sum(kafka_topic_partition_current_offset{topic="market-dlq"})
+              - sum(kafka_topic_partition_oldest_offset{topic="market-dlq"}) > 0
+            for: 0m
+            labels: { severity: warn }
+            annotations:
+              summary: "market-dlq 出現訊息 — 有毒訊息被導入 DLQ，需人工檢視"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: streaming
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  # RWO 的 PVC 遇上 RollingUpdate 會死結——
+  # 新 pod 等磁碟、舊 pod 等新 pod Ready。iceberg-rest 那次的教訓。
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: prometheus
+
+  template:
+    metadata:
+      labels:
+        app: prometheus
+      annotations:
+        # Prometheus 抓自己。用來驗證整條發現鏈是通的——
+        # 連自己都抓不到就不用看別的了。
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: prometheus
+      enableServiceLinks: false
+
+      # ★ prom/prometheus 以 uid 65534(nobody) 執行，
+      #   而 GKE 新建的 PVC 根目錄是 root:root。
+      #   沒有這段的症狀是啟動即失敗：
+      #     "opening storage failed: lock DB directory: open
+      #      /prometheus/lock: permission denied"
+      #   ——iceberg-rest 那次是 SQLITE_CANTOPEN，同一個坑換個訊息。
+      #
+      #   ✅ 實測（2026-08-26）：Uid: 65534 65534 65534 65534
+      #
+      #      查法有兩種，第一種在這個 image 上失敗：
+      #        kubectl run tmp --rm -i --restart=Never \
+      #          --image=prom/prometheus:v3.1.0 --command -- id
+      #        → 沒有輸出（--rm -i 的 attach 競態：容器已經跑完才接上）
+      #
+      #        kubectl run tmp -n streaming --restart=Never \
+      #          --image=prom/prometheus:v3.1.0 --command -- sleep 30
+      #        kubectl exec -n streaming tmp -- cat /proc/self/status | grep -i uid
+      #        → Uid: 65534 65534 65534 65534
+      #
+      #      /proc/self/status 不依賴容器內有什麼工具，比 `id` 可靠。
+      #
+      #   （同一批查證裡，grafana 的 gid 就跟慣例不同：uid=472 但 gid=0。）
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        fsGroupChangePolicy: OnRootMismatch
+
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.1.0
+
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            # 保留 7 天。這是 PoC 的觀察窗，也控制磁碟用量。
+            - --storage.tsdb.retention.time=7d
+            # 讓 POST /-/reload 生效，改設定不用重啟 pod：
+            #   kubectl exec -n streaming deploy/prometheus -- \
+            #     wget -qO- --post-data='' localhost:9090/-/reload
+            - --web.enable-lifecycle
+
+          ports:
+            - name: http
+              containerPort: 9090
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: rules
+              mountPath: /etc/prometheus/rules
+            - name: data
+              mountPath: /prometheus
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+
+          # /-/ready 和 /-/healthy 是 Prometheus 內建的專用端點，
+          # 語意剛好對上 K8s 的兩種 probe——
+          # healthy 問「process 還活著」，ready 問「TSDB 載入完成了嗎」。
+          # 重啟時若 WAL 很大，ready 會晚好幾十秒才通過。
+          startupProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            periodSeconds: 30
+            failureThreshold: 3
+
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: rules
+          configMap:
+            name: prometheus-rules
+        - name: data
+          persistentVolumeClaim:
+            claimName: prometheus-data

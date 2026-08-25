@@ -11,7 +11,8 @@ logger = logging.getLogger(__name__)
 
 BINANCE_TOP20 = [
     "btcusdt", "ethusdt", "bnbusdt",  "solusdt", "xrpusdt",
-    "dogeusdt","adausdt", "avaxusdt", "dotusdt",  "maticusdt",
+    # MATIC 已下架（exchangeInfo status=BREAK），改名成 POL——訂閱舊代號不會報錯，只是永遠不出資料
+    "dogeusdt","adausdt", "avaxusdt", "dotusdt",  "polusdt",
     "linkusdt","ltcusdt", "uniusdt",  "atomusdt", "nearusdt",
     "aptusdt", "opusdt",  "arbusdt",  "suiusdt",  "injusdt"
 ]

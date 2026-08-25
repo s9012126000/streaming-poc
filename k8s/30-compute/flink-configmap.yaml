@@ -1,0 +1,78 @@
+# ---------------------------------------------------------------------------
+# ⚠️⚠️ 這份 ConfigMap 目前**沒有任何地方引用**（2026-08-25 查證）。
+#
+#   grep -rn "flink-common" k8s/ scripts/  →  只有這個檔案自己。
+#   JobManager / TaskManager 都是把設定寫死在各自的 FLINK_PROPERTIES 裡，
+#   沒有 envFrom，也沒有把它當 volume 掛進去。
+#
+#   所以：**改這裡不會有任何效果。** 要改設定請動
+#     k8s/30-compute/flink-jobmanager.yaml  的 FLINK_PROPERTIES
+#     k8s/30-compute/flink-taskmanager.yaml 的 FLINK_PROPERTIES
+#
+#   留著它是因為它記錄了設計意圖（哪些設定是共用的），但這種
+#   「看起來是設定來源、其實是死檔」的東西正是未來除錯的地雷——
+#   會出現「我明明改了啊」然後查半天。要嘛接上、要嘛刪掉，
+#   已列入待辦。接上的做法：兩個 Deployment 改用
+#     envFrom: [{ configMapRef: { name: flink-common } }]
+#   但要注意 Flink 讀的是 FLINK_PROPERTIES 這個變數名，
+#   不是逐鍵的環境變數，所以不是直接改 envFrom 就好。
+# ---------------------------------------------------------------------------
+# Flink 的共用設定（設計意圖記錄）。
+#
+# 對照 compose：FLINK_PROPERTIES 是一個多行字串環境變數，
+# JobManager 和 TaskManager 各寫一份（內容大同小異）。
+# 這裡拆成兩個 ConfigMap——共用的放 flink-common，
+# 角色專屬的（rpc.address / memory）留在各自的 Deployment。
+#
+# 改動的部分只有位址：compose 的 minio:9000 / broker-1:29092
+# 換成 K8s 的 Service DNS。其餘設定原樣沿用。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flink-common
+  namespace: streaming
+  labels:
+    app: flink
+data:
+  # JobManager 的位址——TaskManager 靠這個找到它。
+  # 這是 Service 名稱，不是 pod 名稱：TaskManager 只需要「連到 JobManager」，
+  # 不需要指定是哪一個 pod（單副本），所以用一般 ClusterIP Service 就好。
+  jobmanager.rpc.address: "flink-jobmanager"
+
+  # --- 狀態後端 --------------------------------------------------------
+  state.backend: "rocksdb"
+  state.backend.rocksdb.memory.managed: "true"
+
+  # checkpoint / savepoint 寫到 MinIO（Week 7 建好的 warehouse bucket）。
+  # 這是 Flink 在 K8s 上的關鍵設計：狀態不放本地磁碟，
+  # 所以 TaskManager 可以是無狀態的 Deployment，
+  # 被 Spot 回收後新 pod 從 S3 恢復即可——不需要 StatefulSet + PVC。
+  state.checkpoints.dir: "s3://warehouse/checkpoints"
+  state.savepoints.dir: "s3://warehouse/savepoints"
+
+  # --- S3（其實是 MinIO）-----------------------------------------------
+  s3.endpoint: "http://minio.streaming.svc.cluster.local:9000"
+  s3.path.style.access: "true"
+  # access-key / secret-key 不放這裡——那是憑證，
+  # 改用 AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY 環境變數從 Secret 注入。
+  # Flink 的 S3 檔案系統會自動讀取那兩個標準變數。
+
+  # --- Checkpoint 行為 --------------------------------------------------
+  execution.checkpointing.interval: "60s"
+  execution.checkpointing.min-pause: "10s"
+  execution.checkpointing.mode: "EXACTLY_ONCE"
+  execution.checkpointing.max-concurrent-checkpoints: "2"
+  execution.checkpointing.timeout: "60s"
+
+  # 沒有資料流入的分區會擋住 watermark 前進，
+  # 導致視窗永遠不觸發。30 秒沒資料就視為閒置。
+  table.exec.source.idle-timeout: "30s"
+
+  # --- 指標 -------------------------------------------------------------
+  # Week 9 的 Prometheus 會抓 9249 埠
+  metrics.reporter.prometheus.factory.class: "org.apache.flink.metrics.prometheus.PrometheusReporterFactory"
+  metrics.reporter.prometheus.port: "9249"
+
+  # --- Kafka bootstrap（給 SQL 的 DDL 用）-------------------------------
+  properties.bootstrap.servers: "kafka-bootstrap:9092"

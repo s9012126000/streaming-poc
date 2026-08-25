@@ -1,0 +1,145 @@
+# ---------------------------------------------------------------------------
+# Iceberg catalog 的後端資料庫（Postgres）
+#
+# 為什麼從 SQLite 換過來（2026-08-26，Week 9 演練時炸出來的）：
+#
+#   SQLite 是**單寫者模型**——同一時間只能有一個寫入交易，
+#   第二個不是排隊，是直接失敗。而我們有兩個寫 Iceberg 的 Flink job
+#   （insert_bronze_trades、vwap_1min_silver），checkpoint interval 都是 60 秒，
+#   commit 撞在一起就是：
+#
+#     org.sqlite.SQLiteException: [SQLITE_BUSY] The database file is locked
+#       → org.apache.iceberg.jdbc.UncheckedSQLException
+#       → HTTP 500
+#       → Flink 收到 CommitStateUnknownException → job 進入無法自癒的重啟迴圈
+#
+#   ⚠️ 我當初選 SQLite 時在 manifest 裡寫的理由是
+#        「限制：只能 1 副本（SQLite 檔案鎖），但我們本來就是 replicas: 1」
+#      那句話**只考慮了伺服器有幾個副本，忽略了有幾個 client 同時寫**。
+#      單副本的伺服器一樣會收到並行請求。這是今天最貴的一個判斷失誤。
+#
+#   Postgres 用 MVCC，多個寫入交易可以真正並行，只在動到同一列時才互相等待。
+#   而 Iceberg 的 catalog 寫入是「更新 iceberg_tables 的某一列」——
+#   不同的表根本不會碰到同一列。
+#
+# 為什麼是 StatefulSet：
+#   資料庫需要穩定的身分與同一顆磁碟。這跟 iceberg-rest 不同——
+#   後者現在變成真正無狀態了（狀態全部移到這裡），可以繼續當 Deployment。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog-db
+  namespace: streaming
+  labels:
+    app: catalog-db
+spec:
+  # headless：StatefulSet 需要它提供穩定的 pod DNS。
+  # iceberg-rest 連 catalog-db:5432 也能通——headless service 的 A 記錄
+  # 直接解析到 pod IP（只有一個 pod，所以行為跟 ClusterIP 一樣）。
+  clusterIP: None
+  selector:
+    app: catalog-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: catalog-db
+  namespace: streaming
+  labels:
+    app: catalog-db
+spec:
+  serviceName: catalog-db
+  replicas: 1
+  # 單副本。Postgres 的高可用需要 streaming replication + 自動 failover
+  # （Patroni / CloudNativePG 之類），那是另一個專案的工作量。
+  # 這裡要的是「並行寫入」，不是「高可用」——兩者是不同的問題。
+  selector:
+    matchLabels:
+      app: catalog-db
+
+  template:
+    metadata:
+      labels:
+        app: catalog-db
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+
+          ports:
+            - name: postgres
+              containerPort: 5432
+
+          env:
+            - name: POSTGRES_DB
+              value: iceberg
+            - name: POSTGRES_USER
+              value: iceberg
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: streaming-secrets
+                  key: CATALOG_DB_PASSWORD
+
+            # ★ 必須指定成子目錄，不能直接用 /var/lib/postgresql/data。
+            #   GKE 掛載 ext4 的 PVC 時根目錄會有 lost+found，
+            #   而 initdb 堅持要一個**完全空的**目錄，
+            #   看到 lost+found 就會失敗並印：
+            #     "initdb: error: directory ... exists but is not empty"
+            #   這個坑跟 iceberg-rest 的 fsGroup 屬於同一類：
+            #   「把 PVC 掛給一個對目錄有預期的程式」。
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          # catalog 的寫入量極小（每次 checkpoint 更新幾列），
+          # 這個配置遠超需求。給 512Mi 是因為 Postgres 的
+          # shared_buffers 預設值加上連線開銷，256Mi 會偏緊。
+
+          # pg_isready 是 Postgres 內建的探測工具，
+          # 回答的是「資料庫接受連線了嗎」——比 tcpSocket 有意義得多，
+          # 因為 initdb 期間 5432 就已經在聽了，但還不能用。
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "iceberg", "-d", "iceberg"]
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "iceberg", "-d", "iceberg"]
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "iceberg", "-d", "iceberg"]
+            periodSeconds: 30
+            failureThreshold: 3
+
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 10Gi
+            # catalog 實際只有幾十列，10Gi 是 GCE pd-standard 的最小配置量。

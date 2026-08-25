@@ -31,6 +31,7 @@ class AlpacaProducer:
                                          conf={"auto.register.schemas": False})
         self.producer   = Producer({"bootstrap.servers": kafka_bootstrap})
         self.count      = 0
+        self.wss        = None
 
     async def handle_trade(self, trade):
         record = {
@@ -57,7 +58,17 @@ class AlpacaProducer:
             logger.info(f"[ALPACA] Produced {self.count} msgs | {trade.symbol} @ ${trade.price}")
 
     async def run(self):
-        wss = StockDataStream(self.api_key, self.secret_key)
-        wss.subscribe_trades(self.handle_trade, *NASDAQ_TOP30)
+        self.wss = StockDataStream(self.api_key, self.secret_key)
+        self.wss.subscribe_trades(self.handle_trade, *NASDAQ_TOP30)
         logger.info(f"[ALPACA] 🟢 訂閱 {len(NASDAQ_TOP30)} 支 NASDAQ 股票")
-        await asyncio.to_thread(wss.run)
+        await asyncio.to_thread(self.wss.run)
+
+    def stop(self):
+        """收盤時關掉 stream。
+
+        run() 跑在 to_thread 裡，取消 task 停不掉那條執行緒的 websocket，
+        一定要走 SDK 自己的 stop()（thread-safe，內部最多等 5 秒）。
+        """
+        if self.wss is not None:
+            self.wss.stop()
+            self.wss = None

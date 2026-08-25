@@ -1,0 +1,152 @@
+# ---------------------------------------------------------------------------
+# Producer — Week 8 的第一個部署，刻意選最單純的。
+#
+# 它同時驗證三件事，任何一項壞了都在這裡就會發現：
+#   1. Artifact Registry：node 拉得到自建 image 嗎
+#   2. Secret：Alpaca 憑證注入得進去嗎
+#   3. Kafka client：從 pod 連得到 kafka-bootstrap 嗎
+#
+# 這一步不通就不要往下做 Flink——那邊變因多太多，混在一起無法歸因。
+# ---------------------------------------------------------------------------
+
+# --- 應用層共用設定 --------------------------------------------------------
+# Week 8 的服務大多要連 Kafka / Schema Registry，抽出來共用。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: streaming
+  labels:
+    app: streaming-poc
+data:
+  KAFKA_BOOTSTRAP: "kafka-bootstrap:9092"
+  SCHEMA_REGISTRY: "http://schema-registry:8081"
+  TRINO_HOST: "trino"
+  TRINO_PORT: "8080"
+  CHART_SYMBOL: "BTCUSDT"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: producer
+  namespace: streaming
+  labels:
+    app: producer
+spec:
+  # ⚠️ 一定是 1，不要多副本。
+  # main_producer.py 的邏輯是「同一時間只跑一條 producer」——
+  # 美股盤中跑 Alpaca、其餘時間跑 Binance。開兩份會對同一個 topic
+  # 寫入重複資料，而且兩邊都以為自己是唯一的。
+  # 這不是可用性取捨，是正確性要求。
+  replicas: 1
+
+  strategy:
+    # Recreate 而不是 RollingUpdate：滾動更新期間會有新舊兩個 pod 並存，
+    # 那正是上面要避免的狀況。先停再起，接受幾秒的資料缺口。
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: producer
+
+  template:
+    metadata:
+      labels:
+        app: producer
+      annotations:
+        # Week 9 的 Prometheus 會靠這組 annotation 自動抓取，
+        # 不用改 Prometheus 設定就能納入監控。
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Week 7 坑 4 的教訓：K8s 會為每個 Service 注入 <NAME>_PORT 環境變數，
+      # 可能撞上應用程式的設定變數。全部 Deployment 一律關掉。
+      enableServiceLinks: false
+
+      # 給 producer 時間把緩衝區的訊息 flush 出去再關閉
+      terminationGracePeriodSeconds: 30
+
+      # --- 等 Kafka 與 Schema Registry 都能用 -----------------------
+      initContainers:
+        - name: wait-deps
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              echo "等待 Schema Registry（最多 60 次 × 2 秒）..."
+              for i in $(seq 1 60); do
+                if curl -sf http://schema-registry:8081/subjects >/dev/null 2>&1; then
+                  echo "依賴就緒（第 ${i} 次）"; exit 0
+                fi
+                [ $((i % 10)) -eq 0 ] && echo "  第 ${i} 次仍未就緒"
+                sleep 2
+              done
+              echo "❌ 等待逾時"; exit 1
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+
+      containers:
+        - name: producer
+          # ⚠️ 用 latest 搭配 imagePullPolicy: Always。
+          #    好處是 kubectl rollout restart 就能換版，不用改 manifest。
+          #    代價是「看 manifest 不知道跑的是哪一版」——
+          #    要精確追蹤時改成 13-build-push.sh 印出的具體 tag。
+          #
+          # ⚠️ registry 位址寫死了 region（asia-east1）。
+          #    換 region 時這裡要一起改，否則會拉到舊區的 image
+          #    ——能拉到（跨區可用），但會產生跨區流量費而且比較慢。
+          #    一次性檢查：
+          #      grep -rn "docker.pkg.dev" k8s/ | grep -v asia-east1
+          image: asia-east1-docker.pkg.dev/project-ea92bc23-509c-459a-a30/streaming-poc/producer:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8000
+
+          envFrom:
+            - configMapRef:
+                name: app-config
+
+          env:
+            # Alpaca 憑證從 Secret 來——main_producer.py 用 os.environ[]
+            # 直接取，缺了會在啟動時 KeyError。
+            - name: ALPACA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: streaming-secrets
+                  key: ALPACA_API_KEY
+            - name: ALPACA_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: streaming-secrets
+                  key: ALPACA_SECRET_KEY
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+          # ⚠️ readiness 也用 /healthz 而不是 /readyz。
+          #    /readyz 檢查的是「最近有沒有成功送出資料」，
+          #    但 producer 目前還沒有寫心跳檔案，那個端點會一直回
+          #    "not instrumented"。等應用程式接上心跳再換過去，
+          #    才不會把「功能未實作」誤報成「服務健康」。
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 24        # 最多 2 分鐘
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+            failureThreshold: 3
